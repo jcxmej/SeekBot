@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+seek_config_local.py
+seekbot_run.log
+seekbot_llm.log
+seekbot_clicks.log
+seekbot_actions.log
+seekbot_jobs.csv
+seekbot_qa_memory.csv
+debug_runs/
+playwright-report/
+test-results/

@@ -1,0 +1,7 @@
+playwright
+pdfplumber
+python-docx
+requests
+ollama
+openai
+anthropic
