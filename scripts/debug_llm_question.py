@@ -12,11 +12,11 @@ if ROOT not in sys.path:
 from playwright.sync_api import sync_playwright
 
 from seekbot.llm import build_question_prompt, generate_with_current_provider, parse_question_response
-from seekbot.question_memory import QuestionMemoryStore
 from seekbot.resume_parser import extract_resume_text
 from seekbot.seek.forms import build_qa_memory_table
 from seekbot.seek.search import fetch_job_details, normalize_job_url
 from seekbot.settings import load_settings
+from seekbot.storage import QuestionMemoryStore
 
 
 def _job_url_from_input(url: str) -> str:
@@ -51,6 +51,7 @@ def main() -> None:
     parser.add_argument("job_url", help="Seek job URL or apply URL")
     parser.add_argument("--question", required=True, help="Question text to test")
     parser.add_argument("--option", action="append", default=[], help="Option text. Repeat for multiple options.")
+    parser.add_argument("--multi-select", action="store_true", help="Use the multi-select option-question prompt")
     parser.add_argument("--resume-role", help="Configured resume role key, e.g. 'data engineer'")
     parser.add_argument("--resume-path", help="Absolute resume path override")
     parser.add_argument("--output-dir", default="debug_runs", help="Directory for saved prompt/response artifacts")
@@ -85,9 +86,10 @@ def main() -> None:
         config,
         options,
         qa_memory_table=qa_memory_table,
+        allow_multiple=args.multi_select,
     )
     raw_response = generate_with_current_provider(prompt, config)
-    parsed_response = parse_question_response(raw_response, options, config)
+    parsed_response = parse_question_response(raw_response, options, allow_multiple=args.multi_select)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(
@@ -105,6 +107,7 @@ def main() -> None:
         "model": config.get("llm", {}).get("model", ""),
         "question": args.question,
         "options": options or [],
+        "multi_select": bool(args.multi_select),
     }
 
     with open(os.path.join(run_dir, "context.json"), "w") as handle:

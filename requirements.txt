@@ -5,3 +5,5 @@ requests
 ollama
 openai
 anthropic
+instructor
+sentence-transformers

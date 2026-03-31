@@ -7,7 +7,7 @@ from datetime import datetime
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from seekbot.llm import generate_cover_letter
-from seekbot.models import JobDetails, ResumeChoice
+from seekbot.domain import JobDetails, ResumeChoice
 from seekbot.seek.forms import fill_questionnaire
 from seekbot.seek.search import is_seek_domain_url
 

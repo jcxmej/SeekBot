@@ -5,6 +5,7 @@ CONFIG = {
             "data scientist": "/absolute/path/to/data_scientist_resume.docx",
             "platform engineer": "/absolute/path/to/platform_engineer_resume.docx",
         },
+        "location": "REPLACE_ME",
         "user_data_dir": "/tmp/seekbot-chrome",
         "profile_directory": "Default",
         "compatibility_threshold": 5.0,
@@ -20,7 +21,7 @@ CONFIG = {
     },
     "llm": {
         "enabled": True,
-        "provider": "ollama_client",
+        "provider": "ollama",
         "url": "http://localhost:11434/api/generate",
         "model": "gemma3",
         "temperature": 0.1,

@@ -4,7 +4,7 @@ import os
 import re
 import time
 
-from seekbot.models import ApplicationRecord
+from seekbot.domain import ApplicationRecord
 
 
 CSV_FIELDS = [

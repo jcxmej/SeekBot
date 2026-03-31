@@ -18,10 +18,17 @@ This file records the current project decisions, constraints, and deferred ideas
 
 ## Matching
 
-- Resume matching is currently deterministic and JD-led.
-- Matching uses a single global technical taxonomy for now.
+- Resume matching is currently semantic-first and JD-led.
+- Matching uses local `sentence-transformers` embeddings for scoring.
+- Matching still uses a single global technical taxonomy for keyword explanations and logs.
 - Resume selection compares the JD against every configured resume.
-- The search-role resume is the anchor; another resume must beat it by `resume_switch_margin` to take over.
+- Resume selection uses three signals:
+  - hybrid JD/resume compatibility
+  - search-role stickiness
+  - job-title alignment
+- Job-title alignment should only influence selection when the title gives a meaningful signal.
+- If the title does not clearly align to any configured resume role, the selector should fall back to search-role stickiness plus hybrid compatibility.
+- Compatibility score and resume-selection score are separate and should be logged separately.
 - Matching is intentionally not LLM-scored at runtime right now.
 - Per-role taxonomies are deferred for later evaluation.
 
@@ -30,7 +37,11 @@ This file records the current project decisions, constraints, and deferred ideas
 - The default active local model is currently `gemma3`.
 - Resume text is always sent in full to the LLM. Resume truncation is intentionally removed.
 - `question_issue` is a debug signal only. It should be logged, but it must not block answering by itself.
-- The LLM layer currently uses prompt-based generation plus response parsing/cleaning; schema-validated structured generation is planned later.
+- The LLM layer now uses schema-validated structured generation with Pydantic models and `instructor`.
+- The current structured models are:
+  - `QuestionAnswer`
+  - `CoverLetter`
+  - `ContactExtraction`
 - The module-level LLM logger global is accepted for now as a V1 shortcut, but should be replaced later.
 - The old global LLM disable flag was removed. A failed LLM call should fail that call only, not disable later LLM usage in the same run.
 
@@ -44,6 +55,7 @@ This file records the current project decisions, constraints, and deferred ideas
 - Answers with `confidence <= 0.8` should prompt the user.
 - Verified memory means a human accepted or provided the answer.
 - Exact verified memory is the only memory auto-reuse path in the active flow.
+- Native multi-select questions should use a dedicated multi-option LLM prompt and apply every supported option the model returns.
 - Question extraction is a known weakness; DOM noise can still leak into the extracted question.
 - Standard answers are currently provided to the LLM as table context, but a safe direct standard-answer bypass should be reintroduced later.
 - String-based fuzzy memory reuse was intentionally removed. If non-exact memory reuse is added later, it should use embeddings rather than lexical fuzzy matching.
@@ -89,6 +101,5 @@ This file records the current project decisions, constraints, and deferred ideas
 
 - Improve question extraction so the LLM sees the real employer question.
 - Add support for custom widgets and multi-selects.
-- Move matching toward a hybrid approach: deterministic signals plus semantic similarity without losing explainability.
-- Introduce structured LLM outputs gradually with Pydantic/instructor.
+- Refine the hybrid matcher, including weighting, thresholds, and better semantic memory reuse.
 - Add better automated test coverage.

@@ -4,70 +4,131 @@ from dataclasses import replace
 
 from seekbot.llm import extract_contact, set_logger
 from seekbot.logging_utils import BotLoggers
-from seekbot.matching import compute_compatibility, extract_taxonomy_keywords
-from seekbot.models import ApplicationRecord, CompatibilityResult, ContactInfo, ResumeChoice, ResumeProfile, SearchPlan
-from seekbot.question_memory import QuestionMemoryStore
+from seekbot.matching import compute_compatibility, cosine_similarity, extract_taxonomy_keywords, semantic_embedding
+from seekbot.domain import ApplicationRecord, CompatibilityResult, ContactInfo, ResumeChoice, ResumeProfile, SearchPlan
 from seekbot.resume_parser import extract_resume_text
 from seekbot.seek.application import ApplicationFlow
 from seekbot.seek.browser import SeekBrowser
 from seekbot.seek.search import build_search_urls, fetch_job_details, find_next_page_url, gather_job_cards
 from seekbot.settings import Settings
-from seekbot.storage import CsvJobStore
+from seekbot.storage import CsvJobStore, QuestionMemoryStore
 
 
 def build_search_plans(settings: Settings, search_url: str | None = None, keywords: list[str] | None = None) -> list[SearchPlan]:
     if search_url:
         return [SearchPlan(role_key="manual_search", keyword=None, search_url=search_url)]
     role_keywords = keywords or list(settings.defaults.role_resumes.keys())
-    urls = build_search_urls(role_keywords)
+    urls = build_search_urls(role_keywords, settings.defaults.location)
     return [SearchPlan(role_key=keyword, keyword=keyword, search_url=url) for keyword, url in zip(role_keywords, urls)]
 
 
 def load_resume_profiles(settings: Settings, resume_override: str | None = None) -> list[ResumeProfile]:
     if resume_override:
         text = extract_resume_text(resume_override)
+        keywords = extract_taxonomy_keywords(text, settings.raw.get("matching", {}).get("taxonomy", []))
+        embedding = semantic_embedding(text, settings.raw)
         return [
             ResumeProfile(
                 role_key="override_resume",
                 path=resume_override,
                 text=text,
-                keywords=extract_taxonomy_keywords(text, settings.raw.get("matching", {}).get("taxonomy", [])),
+                keywords=keywords,
+                embedding=embedding,
             )
         ]
     profiles = []
     seen_paths: dict[str, str] = {}
     seen_keywords: dict[str, list[str]] = {}
+    seen_embeddings: dict[str, tuple[float, ...]] = {}
     for role_key, path in settings.defaults.role_resumes.items():
         if path in seen_paths:
             text = seen_paths[path]
             keywords = seen_keywords[path]
+            embedding = seen_embeddings[path]
         else:
             text = extract_resume_text(path)
             keywords = extract_taxonomy_keywords(text, settings.raw.get("matching", {}).get("taxonomy", []))
+            embedding = semantic_embedding(text, settings.raw)
             seen_paths[path] = text
             seen_keywords[path] = keywords
-        profiles.append(ResumeProfile(role_key=role_key, path=path, text=text, keywords=keywords))
+            seen_embeddings[path] = embedding
+        profiles.append(ResumeProfile(role_key=role_key, path=path, text=text, keywords=keywords, embedding=embedding))
     return profiles
+
+
+def _role_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if token}
+
+
+def _title_role_overlap(job_title: str, role_key: str) -> float:
+    title_tokens = _role_tokens(job_title)
+    role_tokens = _role_tokens(role_key)
+    if not title_tokens or not role_tokens:
+        return 0.0
+    normalized_title = re.sub(r"\s+", " ", (job_title or "").lower()).strip()
+    normalized_role = re.sub(r"\s+", " ", (role_key or "").lower()).strip()
+    if normalized_role and normalized_role in normalized_title:
+        return 1.0
+    overlap = title_tokens & role_tokens
+    return len(overlap) / len(role_tokens)
+
+
+def _title_role_match(job_title: str, role_key: str, config: dict) -> float:
+    lexical = _title_role_overlap(job_title, role_key)
+    title_embedding = semantic_embedding(job_title, config)
+    role_embedding = semantic_embedding(role_key, config)
+    semantic = max(0.0, cosine_similarity(title_embedding, role_embedding))
+    if semantic and lexical:
+        return round((semantic * 0.7) + (lexical * 0.3), 4)
+    return round(semantic or lexical, 4)
 
 
 def choose_best_resume(search_role: str, job_text: str, profiles: list[ResumeProfile], config: dict) -> ResumeChoice:
     best = None
     scores = []
+    selection_scores = []
     anchor = None
+    job_title = next((line.strip() for line in (job_text or "").splitlines() if line.strip()), "")
+    taxonomy = list((config.get("matching", {}) or {}).get("taxonomy", []))
+    resolved_job_keywords = extract_taxonomy_keywords(job_text, taxonomy)
+    resolved_job_embedding = semantic_embedding(job_text, config)
+    selection_cfg = (config.get("matching", {}) or {}).get("resume_selection", {})
+    compatibility_weight = float(selection_cfg.get("compatibility_weight", 0.75))
+    title_weight = float(selection_cfg.get("title_weight", 0.2))
+    search_role_weight = float(selection_cfg.get("search_role_weight", 0.05))
+    title_match_threshold = float(selection_cfg.get("title_match_threshold", 0.6))
+    title_matches = {profile.role_key: _title_role_match(job_title, profile.role_key, config) for profile in profiles}
+    title_signal_active = max(title_matches.values(), default=0.0) >= title_match_threshold
     for profile in profiles:
+        title_match = title_matches.get(profile.role_key, 0.0)
         compatibility_dict = compute_compatibility(
             profile.text,
             job_text,
             config,
             resume_keywords=profile.keywords,
+            resume_embedding=profile.embedding,
+            job_keywords=resolved_job_keywords,
+            job_embedding=resolved_job_embedding,
         )
         compatibility = CompatibilityResult(**compatibility_dict)
         scores.append((profile.role_key, compatibility.score))
-        rank = (compatibility.score, 1 if profile.role_key == search_role else 0)
+        selection_score = (
+            (compatibility.score / 10.0) * compatibility_weight
+            + (title_match if title_signal_active else 0.0) * title_weight
+            + (1.0 if profile.role_key == search_role else 0.0) * search_role_weight
+        )
+        selection_scores.append((profile.role_key, round(selection_score, 3)))
+        rank = (
+            round(selection_score, 6),
+            compatibility.score,
+            title_match,
+            1 if profile.role_key == search_role else 0,
+        )
         candidate = {
             "rank": rank,
             "profile": profile,
             "compatibility": compatibility,
+            "title_match": title_match,
         }
         if profile.role_key == search_role:
             anchor = candidate
@@ -75,7 +136,7 @@ def choose_best_resume(search_role: str, job_text: str, profiles: list[ResumePro
             best = candidate
     assert best is not None
     switch_margin = float(config.get("defaults", {}).get("resume_switch_margin", 2.0))
-    if anchor is not None and best["profile"].role_key != search_role:
+    if anchor is not None and best["profile"].role_key != search_role and not title_signal_active:
         anchor_score = anchor["compatibility"].score
         best_score = best["compatibility"].score
         if best_score - anchor_score < switch_margin:
@@ -87,6 +148,7 @@ def choose_best_resume(search_role: str, job_text: str, profiles: list[ResumePro
         resume_text=best["profile"].text,
         compatibility=best["compatibility"],
         candidate_scores=sorted(scores, key=lambda item: item[1], reverse=True),
+        selection_scores=sorted(selection_scores, key=lambda item: item[1], reverse=True),
     )
 
 
@@ -147,9 +209,10 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
     for profile in profiles:
         logging.info("Loaded resume (%d chars): role=%s path=%s", len(profile.text), profile.role_key, profile.path)
         loggers.run.info(
-            "Loaded resume profile: role=%s keywords=%d skills=%s",
+            "Loaded resume profile: role=%s keywords=%d embedding_dims=%d skills=%s",
             profile.role_key,
             len(profile.keywords),
+            len(profile.embedding),
             ", ".join(profile.keywords[:25]) or "-",
         )
     if settings.llm.get("enabled"):
@@ -167,6 +230,12 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
             csv_summary["terminal"],
             csv_summary["retryable_failed"],
         )
+        loggers.run.info(
+            "Loaded job index: total=%d terminal_skips=%d retryable_failed=%d",
+            csv_summary["total"],
+            csv_summary["terminal"],
+            csv_summary["retryable_failed"],
+        )
     if question_summary["total"]:
         logging.info(
             "Loaded QA memory: total=%d verified=%d path=%s",
@@ -179,12 +248,6 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
             question_summary["total"],
             question_summary["verified"],
             settings.logging.question_memory_csv_path,
-        )
-        loggers.run.info(
-            "Loaded job index: total=%d terminal_skips=%d retryable_failed=%d",
-            csv_summary["total"],
-            csv_summary["terminal"],
-            csv_summary["retryable_failed"],
         )
 
     browser = SeekBrowser(
@@ -312,26 +375,32 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
 
                     choice = choose_best_resume(plan.role_key, f"{details.title}\n{details.description}", profiles, settings.raw)
                     logging.info(
-                        "Selected resume role: search_role=%s selected_resume_role=%s scores=%s",
+                        "Selected resume role: search_role=%s selected_resume_role=%s selection_scores=%s compatibility_scores=%s",
                         choice.search_role,
                         choice.selected_role,
+                        ", ".join(f"{role}={score:.3f}" for role, score in choice.selection_scores),
                         ", ".join(f"{role}={score:.1f}" for role, score in choice.candidate_scores),
                     )
                     logging.info(
-                        "Compatibility score: %.1f/10 matched=%s missing=%s",
+                        "Compatibility score: %.1f/10 semantic=%.1f keyword=%.1f matched=%s missing=%s",
                         choice.compatibility.score,
+                        choice.compatibility.semantic_score,
+                        choice.compatibility.keyword_score,
                         ", ".join(choice.compatibility.matched_keywords) or "-",
                         ", ".join(choice.compatibility.missing_keywords) or "-",
                     )
                     loggers.run.info(
-                        "Selected resume role: search_role=%s selected_resume_role=%s scores=%s",
+                        "Selected resume role: search_role=%s selected_resume_role=%s selection_scores=%s compatibility_scores=%s",
                         choice.search_role,
                         choice.selected_role,
+                        ", ".join(f"{role}={score:.3f}" for role, score in choice.selection_scores),
                         ", ".join(f"{role}={score:.1f}" for role, score in choice.candidate_scores),
                     )
                     loggers.run.info(
-                        "Compatibility score: %.1f/10 matched=%s missing=%s",
+                        "Compatibility score: %.1f/10 semantic=%.1f keyword=%.1f matched=%s missing=%s",
                         choice.compatibility.score,
+                        choice.compatibility.semantic_score,
+                        choice.compatibility.keyword_score,
                         ", ".join(choice.compatibility.matched_keywords) or "-",
                         ", ".join(choice.compatibility.missing_keywords) or "-",
                     )

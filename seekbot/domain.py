@@ -14,6 +14,7 @@ class ResumeProfile:
     path: str
     text: str
     keywords: list[str] = field(default_factory=list)
+    embedding: tuple[float, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,8 @@ class JobDetails:
 @dataclass(frozen=True)
 class CompatibilityResult:
     score: float
+    semantic_score: float
+    keyword_score: float
     matched_keywords: list[str]
     missing_keywords: list[str]
     resume_keywords: list[str]
@@ -58,6 +61,7 @@ class ResumeChoice:
     resume_text: str
     compatibility: CompatibilityResult
     candidate_scores: list[tuple[str, float]]
+    selection_scores: list[tuple[str, float]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

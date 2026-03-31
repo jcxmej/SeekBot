@@ -3,14 +3,20 @@ import urllib.parse
 
 from playwright.sync_api import Page
 
-from seekbot.models import ContactInfo, JobCard, JobDetails
+from seekbot.domain import ContactInfo, JobCard, JobDetails
 
 SEEK_BASE_URL = "https://www.seek.com.au"
 SEEK_SEARCH_PATH = "/jobs"
 
 
-def build_search_urls(keywords: list[str]) -> list[str]:
-    return [f"{SEEK_BASE_URL}{SEEK_SEARCH_PATH}?keywords={urllib.parse.quote_plus(keyword)}" for keyword in keywords]
+def build_search_urls(keywords: list[str], location: str = "") -> list[str]:
+    urls: list[str] = []
+    for keyword in keywords:
+        query = {"keywords": keyword}
+        if location.strip():
+            query["location"] = location.strip()
+        urls.append(f"{SEEK_BASE_URL}{SEEK_SEARCH_PATH}?{urllib.parse.urlencode(query)}")
+    return urls
 
 
 def normalize_job_url(url: str) -> str:

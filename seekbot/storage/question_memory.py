@@ -184,6 +184,7 @@ class QuestionMemoryStore:
         scored: list[tuple[float, dict]] = []
         for row in self.rows:
             row_question = normalize_question(row.get("question_text", ""))
+            # This fuzzy comparison is prompt-context only. It does not auto-reuse answers.
             similarity = SequenceMatcher(None, target_question, row_question).ratio()
             if target_options and options_key(row.get("options", "").split(" | ") if row.get("options") else []) == target_options:
                 similarity += 0.2

@@ -7,6 +7,7 @@ from seekbot.config import INTERNAL_CONFIG
 @dataclass(frozen=True)
 class Defaults:
     role_resumes: dict[str, str]
+    location: str
     user_data_dir: str
     profile_directory: str
     compatibility_threshold: float
@@ -54,6 +55,7 @@ def load_settings() -> Settings:
     return Settings(
         defaults=Defaults(
             role_resumes=dict(defaults.get("role_resumes", {})),
+            location=str(defaults.get("location", "") or "").strip(),
             user_data_dir=defaults.get("user_data_dir", "/tmp/seekbot-chrome"),
             profile_directory=defaults.get("profile_directory", "Default"),
             compatibility_threshold=float(defaults.get("compatibility_threshold", 5.0)),

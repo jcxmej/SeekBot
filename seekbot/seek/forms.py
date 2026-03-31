@@ -220,6 +220,44 @@ def _selected_option_value(field) -> str:
         return ""
 
 
+def _check_checkbox(field) -> bool:
+    try:
+        field.check()
+        return True
+    except Exception:
+        pass
+    try:
+        clicked = field.evaluate(
+            """
+            el => {
+              const wrapper = el.closest('label');
+              if (!wrapper) return false;
+              wrapper.click();
+              return !!el.checked;
+            }
+            """
+        )
+        if clicked:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(
+            field.evaluate(
+                """
+                el => {
+                  el.checked = true;
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                  return !!el.checked;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def build_qa_memory_table(config: dict, question_store, question_text: str, options: list[str] | None) -> str:
     lines = ["STANDARD_QA_TABLE", "question_key | answer"]
     for key, value in (config.get("question_answers", {}) or {}).items():
@@ -315,12 +353,12 @@ def fill_questionnaire(
     llm_cfg = config.get("llm", {})
     confidence_threshold = float(llm_cfg.get("question_low_confidence_threshold", 0.8))
 
-    def resolve_answer(question_text: str, options: list[str] | None = None) -> dict:
+    def resolve_answer(question_text: str, options: list[str] | None = None, allow_multiple: bool = False) -> dict:
         if not question_text:
             return {"answer": None, "source": None, "confidence": None}
         if _is_non_question_control(question_text, options):
             return {"answer": None, "source": None, "confidence": None}
-        key = (question_text, tuple(options or []))
+        key = (question_text, tuple(options or []), allow_multiple)
         if key in answer_cache:
             return answer_cache[key]
 
@@ -353,6 +391,7 @@ def fill_questionnaire(
                 config,
                 options,
                 qa_memory_table=qa_memory_table,
+                allow_multiple=allow_multiple,
             )
             if llm_result:
                 answer = llm_result.get("answer")
@@ -470,18 +509,32 @@ def fill_questionnaire(
         if tag == "select":
             option_locator = field.locator("option")
             options = [(option_locator.nth(i).text_content() or "").strip() for i in range(option_locator.count())]
-            resolution = resolve_answer(question_text, options)
+            is_multi_select = False
+            try:
+                is_multi_select = bool(field.evaluate("el => !!el.multiple"))
+            except Exception:
+                is_multi_select = False
+            resolution = resolve_answer(question_text, options, allow_multiple=is_multi_select)
             log_resolution("select", question_text, resolution, options)
             answer = resolution.get("answer")
             if not answer:
                 log_application("select", question_text, resolution, _selected_option_value(field), "no_answer", options)
                 continue
-            best = exact_option_match(options, answer)
-            if best:
+            desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+            matched = []
+            for item in desired:
+                best = exact_option_match(options, item)
+                if best and best not in matched:
+                    matched.append(best)
+            if matched:
                 try:
-                    field.select_option(label=best)
+                    if is_multi_select:
+                        field.select_option(label=matched)
+                    else:
+                        field.select_option(label=matched[0])
                     changed = True
-                    log_application("select", question_text, resolution, _selected_option_value(field) or best, "selected", options)
+                    final_value = ", ".join(matched) if is_multi_select else (_selected_option_value(field) or matched[0])
+                    log_application("select", question_text, resolution, final_value, "selected", options)
                 except Exception:
                     log_application("select", question_text, resolution, _selected_option_value(field), "select_failed", options)
             else:
@@ -567,7 +620,7 @@ def fill_questionnaire(
                 group_question = _find_better_group_question(field, options)
             if _is_resume_field(field, group_question) or _is_cover_letter_field(field, group_question) or _is_non_question_control(group_question, options):
                 continue
-            resolution = resolve_answer(group_question, options)
+            resolution = resolve_answer(group_question, options, allow_multiple=True)
             log_resolution("checkbox", group_question, resolution, options)
             answer = resolution.get("answer")
             if not answer:
@@ -575,16 +628,15 @@ def fill_questionnaire(
                 continue
             desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
             selected_labels: list[str] = []
+            matched_label = False
             for checkbox, label in checkboxes:
                 if any(exact_option_match([label], desired_item) for desired_item in desired):
-                    try:
-                        checkbox.check()
+                    matched_label = True
+                    if _check_checkbox(checkbox):
                         changed = True
                         if label:
                             selected_labels.append(label)
-                    except Exception:
-                        pass
-            status = "selected" if selected_labels else "no_option_match"
+            status = "selected" if selected_labels else ("select_failed" if matched_label else "no_option_match")
             log_application("checkbox", group_question, resolution, ", ".join(selected_labels), status, options)
             continue
 

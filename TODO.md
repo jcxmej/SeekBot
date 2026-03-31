@@ -9,8 +9,7 @@
 
 ## Planned
 
-- Move matching toward a hybrid approach first: keep deterministic signals, add semantic similarity, and preserve explainability in logs/CSV.
-- Introduce structured LLM outputs gradually with Pydantic/instructor, starting with the lowest-risk paths before questionnaire and cover letter flows.
+- Tune the hybrid semantic matcher: weights, thresholds, model choice, and better explanation signals in logs/CSV.
 - Separate the LLM auto-accept threshold from the LLM memory-write policy so low-confidence edge cases do not get stored unintentionally.
 - Evaluate whether the current global matching taxonomy should stay global or move to per-role keyword lists after more real application runs.
 - Add embedding-based questionnaire memory reuse later instead of string-based fuzzy question matching.

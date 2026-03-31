@@ -39,10 +39,10 @@ That is not just a v1 limitation. It is the current product boundary. External a
 SeekBot is split into a few clear layers:
 
 - `seekbot/seek/`: browser automation and Seek-specific page handling
-- `seekbot/matching.py`: deterministic JD-led resume matching
-- `seekbot/llm.py`: LLM prompt construction, provider dispatch, and parsing
-- `seekbot/question_memory.py`: reusable employer-question memory
-- `seekbot/storage.py`: deduplicated job result index
+- `seekbot/matching.py`: semantic JD-led resume matching with keyword explanations
+- `seekbot/llm/`: prompt construction, structured response handling, schemas, and provider adapters
+- `seekbot/storage/`: reusable employer-question memory and deduplicated job result index
+- `seekbot/domain.py`: shared workflow data structures
 - `seekbot/config/`: internal defaults and matching taxonomy
 - `seek_config.py` / `seek_config_local.py`: user-editable config
 
@@ -50,20 +50,30 @@ SeekBot is split into a few clear layers:
 
 The project previously struggled with Selenium flakiness around dynamic form controls, retries, and navigation. The current browser layer uses Playwright because it is better suited to modern dynamic forms and makes state-driven page interactions simpler.
 
-### Why Matching Is Deterministic
+### Why Matching Uses Hybrid Semantic Scoring
 
 Resume selection is intentionally **not** LLM-scored at runtime.
 
 The current matcher:
-- uses a global technical taxonomy
-- detects which taxonomy skills are present in the JD
-- scores each resume by coverage of those detected JD skills
+- uses `sentence-transformers` locally for resume/JD embedding similarity
+- caches resume embeddings at startup
+- computes JD similarity per job
+- keeps taxonomy keyword extraction for explanation and logs
 
-That choice was made because it is easier to debug, cheaper to run, and more stable than letting an LLM decide resume fit from scratch on every job.
+That choice gives you:
+- semantic retrieval instead of pure lexical overlap
+- no API key requirement for matching
+- more robust resume choice across role wording differences
+- still-readable matched/missing keyword logs for debugging
 
 ### Why Employer Questions Use an LLM
 
 Employer questions are less uniform than job descriptions. Option labels and free-text questions vary a lot across employers, so SeekBot uses an LLM for questionnaire answers.
+
+The v2 LLM layer now uses:
+- Pydantic response models
+- `instructor` for schema-constrained generation
+- provider adapters for Ollama, OpenAI, and Anthropic
 
 The current questionnaire flow is:
 
@@ -114,7 +124,7 @@ SeekBot.py
 - a Seek account
 - at least one resume in `.docx`, `.pdf`, or text-compatible format
 - one supported LLM provider:
-  - local Ollama via `ollama_client` or `ollama`
+  - local Ollama via `ollama`
   - OpenAI
   - Anthropic
 
@@ -139,6 +149,8 @@ Edit `seek_config_local.py`:
 
 - `defaults.role_resumes`
   - map each search role to a resume path
+- `defaults.location`
+  - optional search location added to generated Seek search URLs
 - `question_answers`
   - your standard personal answers
 - `llm`
@@ -211,17 +223,17 @@ It saves the rendered prompt, JD, context, raw response, and parsed response und
 
 Supported `llm.provider` values:
 
-- `ollama_client`
 - `ollama`
 - `openai`
 - `anthropic`
 
 Notes:
 
-- `ollama_client` uses the local `ollama` Python package
 - `ollama` uses the Ollama HTTP API
 - `openai` reads `OPENAI_API_KEY` by default
 - `anthropic` reads `ANTHROPIC_API_KEY` by default
+- structured outputs use `instructor`
+- local Ollama structured outputs use Ollama's OpenAI-compatible `/v1` endpoint under the hood
 
 ## Known Limitations
 
@@ -229,7 +241,8 @@ Notes:
 - Questionnaire handling currently focuses on common native controls first: text inputs, textareas, radios, checkboxes, and selects.
 - Question extraction can still be noisy on some custom DOM structures. This is the main known logic weakness in the employer-question flow today.
 - Prefilled questionnaire answers are currently left in place rather than being aggressively overwritten if they differ from the newly resolved answer.
-- Matching currently uses a single global technical taxonomy. Per-role taxonomies are deferred until more real-world runs justify them.
+- Matching currently uses a hybrid semantic scorer: embeddings for selection, taxonomy keywords for explanation. The taxonomy is still global for now.
+- The first semantic matching run needs the embedding model available locally. If it is not cached yet and the machine is offline, SeekBot falls back to lexical matching.
 
 ## Out Of Scope For Now
 
