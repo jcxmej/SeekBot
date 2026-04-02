@@ -74,7 +74,7 @@ def semantic_embedding(text: str, config: dict) -> tuple[float, ...]:
     model_name = matching_cfg.get("embedding_model", "all-MiniLM-L6-v2")
     try:
         model = _load_embedding_model(model_name)
-        vector = model.encode(text or "", normalize_embeddings=True)
+        vector = model.encode(text or "", normalize_embeddings=True, show_progress_bar=False)
         return tuple(float(item) for item in vector.tolist())
     except Exception as exc:
         if model_name not in _LOGGED_EMBEDDING_FAILURES:
@@ -94,6 +94,19 @@ def cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
     if left_norm == 0.0 or right_norm == 0.0:
         return 0.0
     return numerator / (left_norm * right_norm)
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _normalize_semantic_ratio(raw_cosine: float, config: dict) -> float:
+    matching_cfg = (config.get("matching", {}) or {})
+    floor = float(matching_cfg.get("semantic_floor_cosine", 0.15))
+    ceiling = float(matching_cfg.get("semantic_full_cosine", 0.55))
+    if ceiling <= floor:
+        return _clamp(raw_cosine)
+    return _clamp((raw_cosine - floor) / (ceiling - floor))
 
 
 def compute_compatibility(
@@ -117,11 +130,13 @@ def compute_compatibility(
     else:
         keyword_ratio, matched, missing = _fallback_keyword_overlap(resume_text, job_text)
 
+    raw_semantic_cosine = 0.0
     semantic_ratio = 0.0
     resolved_job_embedding = tuple(job_embedding or ()) or semantic_embedding(job_text, config)
     resolved_resume_embedding = tuple(resume_embedding or ()) or semantic_embedding(resume_text, config)
     if resolved_job_embedding and resolved_resume_embedding:
-        semantic_ratio = max(0.0, cosine_similarity(resolved_resume_embedding, resolved_job_embedding))
+        raw_semantic_cosine = max(0.0, cosine_similarity(resolved_resume_embedding, resolved_job_embedding))
+        semantic_ratio = _normalize_semantic_ratio(raw_semantic_cosine, config)
 
     semantic_weight = float(matching_cfg.get("semantic_weight", 0.7))
     keyword_weight = float(matching_cfg.get("keyword_weight", 0.3))
@@ -135,6 +150,7 @@ def compute_compatibility(
     return {
         "score": round(ratio * 10, 1),
         "semantic_score": round(semantic_ratio * 10, 1),
+        "semantic_cosine": round(raw_semantic_cosine, 3),
         "keyword_score": round(keyword_ratio * 10, 1),
         "matched_keywords": matched,
         "missing_keywords": missing,

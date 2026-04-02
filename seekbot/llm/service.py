@@ -9,11 +9,30 @@ from seekbot.llm.providers import create_provider
 from seekbot.llm.schemas import ContactExtraction, CoverLetter, QuestionAnswer
 
 _LOGGER = None
+_FATAL_PROVIDER_FAILURES: dict[str, str] = {}
 
 
 def set_logger(logger) -> None:
     global _LOGGER
     _LOGGER = logger
+
+
+def _is_fatal_provider_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in [
+            "insufficient_quota",
+            "invalid_api_key",
+            "authentication",
+            "api key not found",
+            "billing",
+        ]
+    )
+
+
+def _provider_blocked_reason(provider: str) -> str:
+    return _FATAL_PROVIDER_FAILURES.get(provider, "")
 
 
 def _truncate(text: str | None, limit: int | None) -> str:
@@ -95,7 +114,6 @@ def _generate_structured(provider: str, llm_cfg: dict, prompt: str, response_mod
 
 def build_question_prompt(
     resume_text: str,
-    job_text: str,
     question_text: str,
     config: dict,
     options: list[str] | None = None,
@@ -114,7 +132,6 @@ def build_question_prompt(
         return ""
     return prompt.format(
         resume=resume_text or "",
-        job=_truncate(job_text, llm_cfg.get("max_job_chars", 4000)),
         question=question_text,
         options="\n".join(f"- {item}" for item in (options or [])) or "N/A",
         qa_memory_table=qa_memory_table or "N/A",
@@ -151,7 +168,6 @@ def generate_with_current_provider(prompt: str, config: dict) -> str:
 
 def answer_question(
     resume_text: str,
-    job_text: str,
     question_text: str,
     config: dict,
     options: list[str] | None = None,
@@ -161,9 +177,13 @@ def answer_question(
     llm_cfg = config.get("llm", {})
     if not llm_cfg.get("enabled"):
         return None
+    provider = llm_cfg.get("provider", "ollama").lower()
+    if provider in _FATAL_PROVIDER_FAILURES:
+        if _LOGGER:
+            _LOGGER.info("LLM question skipped: provider=%s disabled reason=%s", provider, _provider_blocked_reason(provider))
+        return None
     prompt = build_question_prompt(
         resume_text,
-        job_text,
         question_text,
         config,
         options,
@@ -172,7 +192,6 @@ def answer_question(
     )
     if not prompt:
         return None
-    provider = llm_cfg.get("provider", "ollama").lower()
     started = time.time()
     if _LOGGER:
         _LOGGER.info(
@@ -206,6 +225,12 @@ def answer_question(
                 )
             return result
         except Exception as exc:
+            if _is_fatal_provider_error(exc):
+                _FATAL_PROVIDER_FAILURES[provider] = str(exc)
+                logging.warning("LLM question unavailable for provider %s; disabling for this run: %s", provider, exc)
+                if _LOGGER:
+                    _LOGGER.info("LLM question fatal failure: provider=%s error=%s", provider, exc)
+                return None
             if attempt == 0:
                 time.sleep(0.8)
                 continue
@@ -220,6 +245,11 @@ def generate_cover_letter(resume_text: str, job_text: str, config: dict) -> str 
     llm_cfg = config.get("llm", {})
     if not llm_cfg.get("enabled"):
         return None
+    provider = llm_cfg.get("provider", "ollama").lower()
+    if provider in _FATAL_PROVIDER_FAILURES:
+        if _LOGGER:
+            _LOGGER.info("LLM cover letter skipped: provider=%s disabled reason=%s", provider, _provider_blocked_reason(provider))
+        return None
     prompt = llm_cfg.get("cover_letter_prompt", "")
     if not prompt:
         return None
@@ -228,7 +258,6 @@ def generate_cover_letter(resume_text: str, job_text: str, config: dict) -> str 
         job=_truncate(job_text, llm_cfg.get("max_job_chars", 4000)),
         signature_name=llm_cfg.get("cover_letter_signature_name", "Candidate"),
     )
-    provider = llm_cfg.get("provider", "ollama").lower()
     started = time.time()
     if _LOGGER:
         _LOGGER.info("LLM cover letter request: provider=%s model=%s", provider, llm_cfg.get("model", ""))
@@ -257,6 +286,12 @@ def generate_cover_letter(resume_text: str, job_text: str, config: dict) -> str 
                 )
             return answer
         except Exception as exc:
+            if _is_fatal_provider_error(exc):
+                _FATAL_PROVIDER_FAILURES[provider] = str(exc)
+                logging.warning("LLM cover letter unavailable for provider %s; disabling for this run: %s", provider, exc)
+                if _LOGGER:
+                    _LOGGER.info("LLM cover letter fatal failure: provider=%s error=%s", provider, exc)
+                return None
             if attempt == 0:
                 time.sleep(0.8)
                 continue
@@ -271,11 +306,15 @@ def extract_contact(job_text: str, config: dict) -> dict | None:
     llm_cfg = config.get("llm", {})
     if not llm_cfg.get("enabled"):
         return None
+    provider = llm_cfg.get("provider", "ollama").lower()
+    if provider in _FATAL_PROVIDER_FAILURES:
+        if _LOGGER:
+            _LOGGER.info("LLM contact skipped: provider=%s disabled reason=%s", provider, _provider_blocked_reason(provider))
+        return None
     prompt = llm_cfg.get("contact_prompt", "")
     if not prompt:
         return None
     payload = prompt.format(job=_truncate(job_text, llm_cfg.get("max_job_chars", 4000)))
-    provider = llm_cfg.get("provider", "ollama").lower()
     if _LOGGER:
         _LOGGER.info("LLM contact request: provider=%s model=%s", provider, llm_cfg.get("model", ""))
     for attempt in range(2):
@@ -283,6 +322,12 @@ def extract_contact(job_text: str, config: dict) -> dict | None:
             structured = _generate_structured(provider, llm_cfg, payload, ContactExtraction)
             return structured.model_dump()
         except Exception as exc:
+            if _is_fatal_provider_error(exc):
+                _FATAL_PROVIDER_FAILURES[provider] = str(exc)
+                logging.warning("LLM contact unavailable for provider %s; disabling for this run: %s", provider, exc)
+                if _LOGGER:
+                    _LOGGER.info("LLM contact fatal failure: provider=%s error=%s", provider, exc)
+                return None
             if attempt == 0:
                 time.sleep(0.8)
                 continue

@@ -24,15 +24,34 @@ For each configured role search, SeekBot:
    - short tailored cover letter
 7. fills employer questions using:
    - verified Q&A memory first
-   - otherwise the LLM
+   - similar verified Q&A next
+   - otherwise the LLM from the resume plus verified prior Q&A context
    - otherwise the user if confidence is too low
-8. records the outcome in a local CSV index
+8. records the outcome in local persistence, with Postgres as the primary backend
 
 ## Current Scope
 
 The current project scope is **Quick Apply only**.
 
 That is not just a v1 limitation. It is the current product boundary. External apply flows and non-Quick Apply flows are out of scope right now.
+
+## Version History
+
+- `v1`
+  - initial GitHub publish
+  - Quick Apply-only runtime
+  - CSV job index and local Q&A memory
+- `v1.5`
+  - internal package cleanup: `llm/`, `storage/`, `domain.py`
+  - structured LLM outputs with schemas
+  - hybrid semantic resume matching
+  - search `location` support
+- `v2`
+  - local Postgres + `pgvector` for jobs and Q&A memory
+  - semantic verified-memory retrieval for employer questions
+  - questionnaire flow changed to memory-first, with resume-only LLM answering
+  - Hugging Face added as a first-class hosted provider
+  - API-backed cover letters, contact extraction, and structured questionnaire answers
 
 ## Design Overview
 
@@ -42,6 +61,8 @@ SeekBot is split into a few clear layers:
 - `seekbot/matching.py`: semantic JD-led resume matching with keyword explanations
 - `seekbot/llm/`: prompt construction, structured response handling, schemas, and provider adapters
 - `seekbot/storage/`: reusable employer-question memory and deduplicated job result index
+- local Postgres is now the primary storage backend for job outcomes and Q&A memory
+- CSV persistence remains only as a fallback/bootstrap path when Postgres is not configured or unavailable
 - `seekbot/domain.py`: shared workflow data structures
 - `seekbot/config/`: internal defaults and matching taxonomy
 - `seek_config.py` / `seek_config_local.py`: user-editable config
@@ -68,19 +89,22 @@ That choice gives you:
 
 ### Why Employer Questions Use an LLM
 
-Employer questions are less uniform than job descriptions. Option labels and free-text questions vary a lot across employers, so SeekBot uses an LLM for questionnaire answers.
+Employer questions are less uniform than job descriptions. Option labels and free-text questions vary a lot across employers, so SeekBot uses an LLM for questionnaire answers. The questionnaire prompt uses the resume plus verified prior Q&A memory, not the JD.
 
 The v2 LLM layer now uses:
 - Pydantic response models
 - `instructor` for schema-constrained generation
-- provider adapters for Ollama, OpenAI, and Anthropic
+- provider adapters for Ollama, Hugging Face, OpenAI, and Anthropic
 
 The current questionnaire flow is:
 
 1. exact verified memory match
-2. otherwise ask the LLM
-3. if `confidence <= 0.8`, ask the user
-4. store the final answer in local Q&A memory
+2. similar verified memory candidate
+3. otherwise ask the LLM from the resume plus verified prior Q&A context
+4. if `confidence <= 0.85`, ask the user
+5. store the applied answer in Q&A memory, but only verified answers are reused or shown back to the model as trusted context
+
+The job description is intentionally not part of questionnaire answering anymore. It stays available for matching, contact extraction, and cover letters, but not for candidate-fact questions.
 
 This creates a simple self-improving loop:
 - the LLM is the guesser
@@ -91,21 +115,31 @@ This creates a simple self-improving loop:
 
 ```text
 seekbot/
+  __main__.py
   cli.py
   workflow.py
   settings.py
   logging_utils.py
-  storage.py
-  question_memory.py
+  domain.py
   resume_parser.py
   matching.py
-  llm.py
-  llm_providers.py
-  models.py
+  llm/
+    __init__.py
+    service.py
+    providers.py
+    schemas.py
+  storage/
+    __init__.py
+    db.py
+    jobs.py
+    question_memory.py
+    schema.sql
   config/
+    __init__.py
     internal.py
     matching.py
   seek/
+    __init__.py
     browser.py
     search.py
     forms.py
@@ -123,8 +157,10 @@ SeekBot.py
 - Google Chrome or Chromium for Playwright
 - a Seek account
 - at least one resume in `.docx`, `.pdf`, or text-compatible format
+- local Postgres with `pgvector` for the primary storage path
 - one supported LLM provider:
   - local Ollama via `ollama`
+  - Hugging Face via `huggingface`
   - OpenAI
   - Anthropic
 
@@ -151,10 +187,12 @@ Edit `seek_config_local.py`:
   - map each search role to a resume path
 - `defaults.location`
   - optional search location added to generated Seek search URLs
-- `question_answers`
-  - your standard personal answers
+- `storage`
+  - Postgres backend settings
+  - either set `storage.dsn` or export `SEEKBOT_POSTGRES_DSN`
 - `llm`
   - provider, model, URL, API env vars, and signature name
+  - for Hugging Face, set `api_key_env` to `HF_TOKEN`
 
 `seek_config.py` is the public template.  
 `seek_config_local.py` is your private local file and is ignored by git.
@@ -197,11 +235,13 @@ SeekBot writes several local runtime files:
 - `seekbot_clicks.log`
   - navigation and click trace
 - `seekbot_jobs.csv`
-  - deduplicated job outcome index
+  - CSV fallback / legacy bootstrap source for job outcomes
 - `seekbot_qa_memory.csv`
-  - reusable employer-question memory
+  - CSV fallback / legacy bootstrap source for employer-question memory
+- `.seekbot-postgres/`
+  - optional local Postgres cluster data directory if you use the project-local database setup
 
-These are local runtime artifacts and should not be committed.
+The primary persistent storage path is now Postgres for jobs and Q&A memory. These local files are still useful as fallback or bootstrap artifacts and should not be committed.
 
 ## Debugging A Single LLM Question
 
@@ -224,13 +264,16 @@ It saves the rendered prompt, JD, context, raw response, and parsed response und
 Supported `llm.provider` values:
 
 - `ollama`
+- `huggingface`
 - `openai`
 - `anthropic`
 
 Notes:
 
 - `ollama` uses the Ollama HTTP API
+- `huggingface` uses the Hugging Face OpenAI-compatible router at `https://router.huggingface.co/v1`
 - `openai` reads `OPENAI_API_KEY` by default
+- `huggingface` reads `HF_TOKEN` by default
 - `anthropic` reads `ANTHROPIC_API_KEY` by default
 - structured outputs use `instructor`
 - local Ollama structured outputs use Ollama's OpenAI-compatible `/v1` endpoint under the hood
@@ -273,6 +316,8 @@ The next version should focus on:
 - better question extraction from messy DOM structures
 - broader support for custom widgets and multi-select controls
 - hybrid resume matching: keep deterministic matching but add semantic similarity carefully without losing explainability
+- local Postgres + `pgvector` as the next persistence layer instead of flat CSVs and debug folders
+- DB-backed semantic employer-question memory instead of a separate ChromaDB step
 - gradual migration toward structured LLM outputs using schema-validated models
 - stronger automated test coverage
 

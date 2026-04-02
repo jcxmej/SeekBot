@@ -184,6 +184,41 @@ def _is_non_question_control(question_text: str, options: list[str] | None = Non
     return _looks_like_choice_label(question_text, options)
 
 
+def _is_sensitive_personal_fact_question(question_text: str) -> bool:
+    lowered = normalize_choice(question_text)
+    if not lowered:
+        return False
+    phrases = [
+        "security clearance",
+        "clearance",
+        "citizen",
+        "citizenship",
+        "permanent resident",
+        "residency",
+        "visa",
+        "work rights",
+        "right to work",
+        "sponsorship",
+        "sponsor",
+        "license",
+        "licence",
+        "police check",
+        "working with children",
+        "criminal",
+        "conviction",
+        "bankruptcy",
+        "salary",
+        "compensation",
+        "remuneration",
+        "pay rate",
+        "hourly rate",
+        "daily rate",
+        "annual base salary",
+        "salary expectation",
+    ]
+    return any(phrase in lowered for phrase in phrases)
+
+
 def _is_visible_enabled(field) -> bool:
     try:
         return field.is_visible() and field.is_enabled()
@@ -258,18 +293,11 @@ def _check_checkbox(field) -> bool:
         return False
 
 
-def build_qa_memory_table(config: dict, question_store, question_text: str, options: list[str] | None) -> str:
-    lines = ["STANDARD_QA_TABLE", "question_key | answer"]
-    for key, value in (config.get("question_answers", {}) or {}).items():
-        if is_placeholder_answer(value):
-            continue
-        lines.append(f"{key} | {str(value).strip()}")
+def _build_qa_memory_table(question_store, question_text: str, options: list[str] | None) -> str:
     prior = question_store.format_prompt_context(question_text, options) if question_store else "N/A"
     if prior != "N/A":
-        lines.append("")
-        lines.append("PRIOR_QUESTIONNAIRE_QA")
-        lines.append(prior)
-    return "\n".join(lines)
+        return "\n".join(["VERIFIED_PRIOR_QUESTIONNAIRE_QA", prior])
+    return "N/A"
 
 
 def _prompt_user_for_answer(
@@ -351,7 +379,7 @@ def fill_questionnaire(
     processed_checkbox: set[str] = set()
     answer_cache: dict[tuple[str, tuple[str, ...]], dict] = {}
     llm_cfg = config.get("llm", {})
-    confidence_threshold = float(llm_cfg.get("question_low_confidence_threshold", 0.8))
+    confidence_threshold = float(llm_cfg.get("question_low_confidence_threshold", 0.85))
 
     def resolve_answer(question_text: str, options: list[str] | None = None, allow_multiple: bool = False) -> dict:
         if not question_text:
@@ -367,6 +395,7 @@ def fill_questionnaire(
         confidence = None
         reason = ""
         question_issue = ""
+        requires_confirmation = False
 
         if not answer and question_store:
             memory_row = question_store.lookup_exact(question_text, options)
@@ -382,11 +411,37 @@ def fill_questionnaire(
                         answer[:200],
                     )
 
+        if not answer and question_store and hasattr(question_store, "lookup_similar_verified"):
+            similar_row = question_store.lookup_similar_verified(question_text, options)
+            if similar_row:
+                similar_answer = str(similar_row.get("answer", "") or "").strip()
+                similar_question = str(similar_row.get("question_text", "") or "").strip()
+                similar_confidence = float(similar_row.get("similarity") or 0.0)
+                if similar_answer and similar_confidence > confidence_threshold:
+                    answer = similar_answer
+                    source = "memory_similar"
+                    confidence = similar_confidence
+                    reason = f"Reused verified answer from similar question: {similar_question[:160]}"
+                else:
+                    user_answer, user_source, user_confidence = _prompt_user_for_answer(
+                        question_text,
+                        options,
+                        similar_answer,
+                        similar_confidence,
+                        f"Verified prior answer from similar question: {similar_question[:160]}",
+                        config,
+                        run_logger,
+                    )
+                    if user_answer:
+                        answer = user_answer
+                        source = user_source
+                        confidence = user_confidence
+                        reason = "Confirmed from similar verified memory."
+
         if not answer:
-            qa_memory_table = build_qa_memory_table(config, question_store, question_text, options)
+            qa_memory_table = _build_qa_memory_table(question_store, question_text, options)
             llm_result = answer_question(
                 resume_text,
-                job_text,
                 question_text,
                 config,
                 options,
@@ -399,6 +454,11 @@ def fill_questionnaire(
                 confidence = float(llm_result.get("confidence") or 0.0)
                 reason = (llm_result.get("reason") or "").strip()
                 question_issue = (llm_result.get("question_issue") or "").strip()
+                if answer and _is_sensitive_personal_fact_question(question_text):
+                    confidence = min(float(confidence or 0.0), confidence_threshold)
+                    requires_confirmation = True
+                    if not reason:
+                        reason = "Sensitive personal question requires user confirmation without verified memory."
             else:
                 reason = ""
 
@@ -426,6 +486,10 @@ def fill_questionnaire(
                 answer = user_answer
                 source = user_source
                 confidence = user_confidence
+            elif requires_confirmation:
+                answer = None
+                source = None
+                confidence = None
 
         result = {
             "answer": answer,
@@ -471,6 +535,7 @@ def fill_questionnaire(
         answer = resolution.get("answer") if resolution else None
         source = resolution.get("source") if resolution else None
         confidence = resolution.get("confidence") if resolution else None
+        persistable_statuses = {"selected", "filled", "filled_js"}
         if run_logger and question_text:
             run_logger.info(
                 "Employer question applied: kind=%s status=%s source=%s confidence=%s question=%r options=%s resolved_answer=%r final_value=%r",
@@ -483,14 +548,23 @@ def fill_questionnaire(
                 (answer or "")[:250],
                 (final_value or "")[:250],
             )
-        if question_store and question_text and final_value:
+        if question_store and hasattr(question_store, "record_application_event") and question_text:
+            question_store.record_application_event(
+                kind=kind,
+                question_text=question_text,
+                options=options,
+                resolution=resolution,
+                final_value=final_value,
+                status=status,
+            )
+        if question_store and question_text and final_value and status in persistable_statuses and source in {"user", "memory", "memory_similar", "llm"}:
             question_store.remember(
                 question_text=question_text,
                 options=options,
                 answer=final_value,
                 answered_by=(source or "unknown"),
                 confidence=confidence,
-                verified=(source == "user"),
+                verified=(source in {"user", "memory", "memory_similar"}),
             )
 
     count = fields.count()

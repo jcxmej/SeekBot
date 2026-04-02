@@ -81,7 +81,6 @@ def main() -> None:
     qa_memory_table = build_qa_memory_table(config, question_store, args.question, options)
     prompt = build_question_prompt(
         resume_text,
-        f"{details.title}\n{details.description}",
         args.question,
         config,
         options,

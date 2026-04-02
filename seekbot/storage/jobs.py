@@ -62,21 +62,10 @@ class CsvJobStore:
         return normalized
 
     def _row_key(self, row: dict) -> str:
-        url = str(row.get("url", "")).strip()
-        match = re.search(r"/job/(\d+)", url)
-        if match:
-            return match.group(1)
-        job_id = str(row.get("job_index", "")).strip()
-        return job_id or url
+        return resolve_job_key(str(row.get("url", "")).strip(), str(row.get("job_index", "")).strip())
 
     def _lookup_key(self, url_or_job_id: str) -> str:
-        value = str(url_or_job_id or "").strip()
-        if not value:
-            return ""
-        if value.isdigit():
-            return value
-        match = re.search(r"/job/(\d+)", value)
-        return match.group(1) if match else value
+        return resolve_job_lookup_key(url_or_job_id)
 
     def _load_existing(self) -> None:
         if not os.path.exists(self.path):
@@ -153,3 +142,20 @@ class CsvJobStore:
             if status in RETRYABLE_FAILURE_STATUSES:
                 summary["retryable_failed"] += 1
         return summary
+
+
+def resolve_job_key(url: str, job_id: str = "") -> str:
+    match = re.search(r"/job/(\d+)", url or "")
+    if match:
+        return match.group(1)
+    return str(job_id or "").strip() or str(url or "").strip()
+
+
+def resolve_job_lookup_key(url_or_job_id: str) -> str:
+    value = str(url_or_job_id or "").strip()
+    if not value:
+        return ""
+    if value.isdigit():
+        return value
+    match = re.search(r"/job/(\d+)", value)
+    return match.group(1) if match else value

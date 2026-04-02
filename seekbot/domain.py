@@ -46,6 +46,7 @@ class JobDetails:
 class CompatibilityResult:
     score: float
     semantic_score: float
+    semantic_cosine: float
     keyword_score: float
     matched_keywords: list[str]
     missing_keywords: list[str]

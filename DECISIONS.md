@@ -15,6 +15,8 @@ This file records the current project decisions, constraints, and deferred ideas
   2. `seek_config`
 - `seek_config.py` is the public template.
 - `seek_config_local.py` is the private local override and is ignored by git.
+- Storage now defaults to local Postgres.
+- CSV persistence remains as fallback only when Postgres is not configured or unavailable.
 
 ## Matching
 
@@ -35,6 +37,7 @@ This file records the current project decisions, constraints, and deferred ideas
 ## LLM Behavior
 
 - The default active local model is currently `gemma3`.
+- The default hosted/template provider is currently Hugging Face using `deepseek-ai/DeepSeek-V3-0324`.
 - Resume text is always sent in full to the LLM. Resume truncation is intentionally removed.
 - `question_issue` is a debug signal only. It should be logged, but it must not block answering by itself.
 - The LLM layer now uses schema-validated structured generation with Pydantic models and `instructor`.
@@ -49,25 +52,41 @@ This file records the current project decisions, constraints, and deferred ideas
 
 - Current answer priority is:
   1. exact verified memory
-  2. LLM
-  3. user if confidence is too low
-- Only answers with `confidence > 0.8` should be auto-accepted.
-- Answers with `confidence <= 0.8` should prompt the user.
+  2. similar verified memory
+  3. LLM from resume plus verified prior Q&A context
+  4. user if confidence is too low
+- The questionnaire-answering prompt should not use the JD. It should use the resume plus verified prior Q&A memory only.
+- Only answers with `confidence > 0.85` should be auto-accepted.
+- Answers with `confidence <= 0.85` should prompt the user.
 - Verified memory means a human accepted or provided the answer.
-- Exact verified memory is the only memory auto-reuse path in the active flow.
+- Exact verified memory auto-reuses directly.
+- Similar verified memory may auto-apply when its confidence is above the active threshold. Otherwise it should be presented to the user for confirmation.
 - Native multi-select questions should use a dedicated multi-option LLM prompt and apply every supported option the model returns.
 - Question extraction is a known weakness; DOM noise can still leak into the extracted question.
-- Standard answers are currently provided to the LLM as table context, but a safe direct standard-answer bypass should be reintroduced later.
-- String-based fuzzy memory reuse was intentionally removed. If non-exact memory reuse is added later, it should use embeddings rather than lexical fuzzy matching.
+- The old static `question_answers` questionnaire dictionary is removed from the active questionnaire flow.
+- Questionnaire memory may store unverified LLM answers as the latest state for that exact canonical question, but read paths must stay restricted to verified rows for direct reuse and trusted prompt context.
+- String-based fuzzy memory reuse was intentionally removed as an auto-answer path. If non-exact memory reuse expands later, it should stay confirmation-gated and eventually use embeddings rather than lexical fuzzy matching.
 
-## Q&A Memory CSV
+## Storage
 
-- The Q&A memory CSV is a local growing answer store.
-- It records the final answer actually applied or observed on the page, not every intermediate guess.
-- Only user-confirmed answers are marked verified by default.
-- Low-confidence edge cases currently need a cleaner separation between:
+- Jobs and Q&A memory are moving behind a Postgres-backed storage layer.
+- Jobs and Q&A memory are now primarily stored in Postgres, with CSV retained only as fallback/bootstrap.
+- The primary storage path should stay behind the existing store-style boundary, not leak into Playwright/browser code.
+- Existing CSV files are retained as fallback/bootstrap sources, not as the preferred runtime store.
+- The Q&A memory store records the final answer actually applied or observed on the page, not every intermediate guess.
+- Only verified answers should be reused directly or included as trusted Q&A context for the LLM.
+- Low-confidence edge cases still need a cleaner separation between:
   - auto-accept threshold
   - memory-write policy
+- The current V2 storage direction is local Postgres plus `pgvector`.
+- Current state:
+  - jobs are stored in the `jobs` table
+  - Q&A memory is stored in the `qa_memory` table with embeddings
+  - logs and debug prompt artifacts are still file-based for now
+- `pgvector` is the intended semantic-memory path. ChromaDB is not the preferred next step right now.
+- The storage boundary should remain clean:
+  - Playwright/browser code should still depend on storage interfaces
+  - database implementation details should stay inside the storage layer
 
 ## Apply Flow
 
@@ -102,4 +121,6 @@ This file records the current project decisions, constraints, and deferred ideas
 - Improve question extraction so the LLM sees the real employer question.
 - Add support for custom widgets and multi-selects.
 - Refine the hybrid matcher, including weighting, thresholds, and better semantic memory reuse.
+- Move local persistence from CSV/files to Postgres with `pgvector`.
+- Use DB queries as the first eval/reporting layer instead of adding a separate eval CSV.
 - Add better automated test coverage.

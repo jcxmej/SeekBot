@@ -11,7 +11,7 @@ from seekbot.seek.application import ApplicationFlow
 from seekbot.seek.browser import SeekBrowser
 from seekbot.seek.search import build_search_urls, fetch_job_details, find_next_page_url, gather_job_cards
 from seekbot.settings import Settings
-from seekbot.storage import CsvJobStore, QuestionMemoryStore
+from seekbot.storage import create_storage
 
 
 def build_search_plans(settings: Settings, search_url: str | None = None, keywords: list[str] | None = None) -> list[SearchPlan]:
@@ -219,35 +219,44 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
         logging.info("LLM features enabled (%s).", settings.llm.get("provider", "unknown"))
 
     search_plans = build_search_plans(settings, getattr(args, "search_url", None), getattr(args, "keywords", None))
-    csv_store = CsvJobStore(settings.logging.csv_log_path)
-    question_store = QuestionMemoryStore(settings.logging.question_memory_csv_path)
+    csv_store, question_store = create_storage(settings)
     csv_summary = csv_store.status_summary()
     question_summary = question_store.summary()
+    job_backend = type(csv_store).__name__
+    question_backend = type(question_store).__name__
+    job_path = settings.logging.csv_log_path if job_backend == "CsvJobStore" else "postgres"
+    question_path = settings.logging.question_memory_csv_path if question_backend == "QuestionMemoryStore" else "postgres"
     if csv_summary["total"]:
         logging.info(
-            "Loaded job index: total=%d terminal_skips=%d retryable_failed=%d",
+            "Loaded job index: total=%d terminal_skips=%d retryable_failed=%d backend=%s path=%s",
             csv_summary["total"],
             csv_summary["terminal"],
             csv_summary["retryable_failed"],
+            job_backend,
+            job_path,
         )
         loggers.run.info(
-            "Loaded job index: total=%d terminal_skips=%d retryable_failed=%d",
+            "Loaded job index: total=%d terminal_skips=%d retryable_failed=%d backend=%s path=%s",
             csv_summary["total"],
             csv_summary["terminal"],
             csv_summary["retryable_failed"],
+            job_backend,
+            job_path,
         )
     if question_summary["total"]:
         logging.info(
-            "Loaded QA memory: total=%d verified=%d path=%s",
+            "Loaded QA memory: total=%d verified=%d backend=%s path=%s",
             question_summary["total"],
             question_summary["verified"],
-            settings.logging.question_memory_csv_path,
+            question_backend,
+            question_path,
         )
         loggers.run.info(
-            "Loaded QA memory: total=%d verified=%d path=%s",
+            "Loaded QA memory: total=%d verified=%d backend=%s path=%s",
             question_summary["total"],
             question_summary["verified"],
-            settings.logging.question_memory_csv_path,
+            question_backend,
+            question_path,
         )
 
     browser = SeekBrowser(
@@ -318,8 +327,6 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
                             indexed.get("reason", ""),
                         )
                     details = fetch_job_details(page, card.url)
-                    if settings.llm.get("enabled") and details.description:
-                        details = replace(details, contact=_merge_contact(details.contact, extract_contact(details.description, settings.raw)))
                     logging.info("Evaluating (%d): %s", checked, details.title)
                     logging.info("Quick apply detected: %s", details.quick_apply)
                     loggers.run.info("Evaluating (%d): %s", checked, details.title)
@@ -382,9 +389,10 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
                         ", ".join(f"{role}={score:.1f}" for role, score in choice.candidate_scores),
                     )
                     logging.info(
-                        "Compatibility score: %.1f/10 semantic=%.1f keyword=%.1f matched=%s missing=%s",
+                        "Compatibility score: %.1f/10 semantic=%.1f raw_cosine=%.3f keyword=%.1f matched=%s missing=%s",
                         choice.compatibility.score,
                         choice.compatibility.semantic_score,
+                        choice.compatibility.semantic_cosine,
                         choice.compatibility.keyword_score,
                         ", ".join(choice.compatibility.matched_keywords) or "-",
                         ", ".join(choice.compatibility.missing_keywords) or "-",
@@ -397,9 +405,10 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
                         ", ".join(f"{role}={score:.1f}" for role, score in choice.candidate_scores),
                     )
                     loggers.run.info(
-                        "Compatibility score: %.1f/10 semantic=%.1f keyword=%.1f matched=%s missing=%s",
+                        "Compatibility score: %.1f/10 semantic=%.1f raw_cosine=%.3f keyword=%.1f matched=%s missing=%s",
                         choice.compatibility.score,
                         choice.compatibility.semantic_score,
+                        choice.compatibility.semantic_cosine,
                         choice.compatibility.keyword_score,
                         ", ".join(choice.compatibility.matched_keywords) or "-",
                         ", ".join(choice.compatibility.missing_keywords) or "-",
@@ -425,6 +434,9 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
                             )
                         )
                         continue
+
+                    if settings.llm.get("enabled") and details.description:
+                        details = replace(details, contact=_merge_contact(details.contact, extract_contact(details.description, settings.raw)))
 
                     success, reason = apply_flow.apply(details, choice, dry_run=args.dry_run)
                     if success:

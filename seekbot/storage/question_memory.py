@@ -38,6 +38,22 @@ def question_hash(question_text: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12] if normalized else ""
 
 
+def question_lookup_key(question_text: str, options: list[str] | None) -> str:
+    normalized = normalize_question(question_text)
+    option_text = options_key(options)
+    if not normalized and not option_text:
+        return ""
+    return hashlib.sha1(f"{normalized}\n{option_text}".encode("utf-8")).hexdigest()
+
+
+def question_embedding_text(question_text: str, options: list[str] | None) -> str:
+    normalized_question = (question_text or "").strip()
+    normalized_options = normalize_options(options)
+    if not normalized_options:
+        return normalized_question
+    return f"{normalized_question}\nOPTIONS:\n- " + "\n- ".join(normalized_options)
+
+
 class QuestionMemoryStore:
     def __init__(self, path: str):
         self.path = path
@@ -99,10 +115,10 @@ class QuestionMemoryStore:
         }
 
     def _exact_index(self, question_text: str, options: list[str] | None) -> int | None:
-        target_hash = question_hash(question_text)
-        target_options = options_key(options)
+        target_key = question_lookup_key(question_text, options)
         for index, row in enumerate(self.rows):
-            if row.get("question_hash") == target_hash and options_key(row.get("options", "").split(" | ") if row.get("options") else []) == target_options:
+            row_options = row.get("options", "").split(" | ") if row.get("options") else []
+            if question_lookup_key(row.get("question_text", ""), row_options) == target_key:
                 return index
         return None
 
@@ -138,9 +154,9 @@ class QuestionMemoryStore:
         previous_answer = row.get("answer", "")
         previous_uses = int(row.get("times_used") or 1)
         if previous_answer == answer:
-            updated_source = answered_by if answered_by in {"user", "standard"} else (row.get("answered_by", answered_by) or answered_by)
+            updated_source = answered_by if answered_by == "user" else (row.get("answered_by", answered_by) or answered_by)
             updated_confidence = confidence
-            if updated_source not in {"user", "standard"} and row.get("confidence"):
+            if updated_source != "user" and row.get("confidence"):
                 try:
                     updated_confidence = max(float(row.get("confidence") or 0.0), float(confidence or 0.0))
                 except Exception:
@@ -178,11 +194,44 @@ class QuestionMemoryStore:
             return False
         return row.get("verified", "false") == "true"
 
+    def lookup_similar_verified(
+        self,
+        question_text: str,
+        options: list[str] | None,
+        *,
+        min_similarity: float = 0.68,
+    ) -> dict | None:
+        target_question = normalize_question(question_text)
+        target_options = options_key(options)
+        target_key = question_lookup_key(question_text, options)
+        best_row: dict | None = None
+        best_score = 0.0
+        for row in self.rows:
+            if row.get("verified", "false") != "true":
+                continue
+            row_options = row.get("options", "").split(" | ") if row.get("options") else []
+            if question_lookup_key(row.get("question_text", ""), row_options) == target_key:
+                continue
+            row_question = normalize_question(row.get("question_text", ""))
+            similarity = SequenceMatcher(None, target_question, row_question).ratio()
+            if target_options and options_key(row_options) == target_options:
+                similarity += 0.1
+            if similarity > best_score:
+                best_score = similarity
+                best_row = row
+        if not best_row or best_score < min_similarity:
+            return None
+        result = dict(best_row)
+        result["similarity"] = round(best_score, 4)
+        return result
+
     def format_prompt_context(self, question_text: str, options: list[str] | None, limit: int = 5) -> str:
         target_question = normalize_question(question_text)
         target_options = options_key(options)
         scored: list[tuple[float, dict]] = []
         for row in self.rows:
+            if row.get("verified", "false") != "true":
+                continue
             row_question = normalize_question(row.get("question_text", ""))
             # This fuzzy comparison is prompt-context only. It does not auto-reuse answers.
             similarity = SequenceMatcher(None, target_question, row_question).ratio()
@@ -205,3 +254,23 @@ class QuestionMemoryStore:
     def summary(self) -> dict[str, int]:
         verified = sum(1 for row in self.rows if row.get("verified") == "true")
         return {"total": len(self.rows), "verified": verified}
+
+    def prune_unverified(self) -> int:
+        before = len(self.rows)
+        self.rows = [row for row in self.rows if row.get("verified") == "true"]
+        removed = before - len(self.rows)
+        if removed:
+            self._write_all()
+        return removed
+
+    def record_application_event(
+        self,
+        *,
+        kind: str,
+        question_text: str,
+        options: list[str] | None,
+        resolution: dict | None,
+        final_value: str | None,
+        status: str,
+    ) -> None:
+        return None

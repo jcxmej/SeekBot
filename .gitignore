@@ -11,3 +11,4 @@ seekbot_qa_memory.csv
 debug_runs/
 playwright-report/
 test-results/
+.seekbot-postgres/

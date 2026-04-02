@@ -26,9 +26,19 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    backend: str
+    dsn: str
+    dsn_env: str
+    fallback_to_csv: bool
+    vector_dims: int
+
+
+@dataclass(frozen=True)
 class Settings:
     defaults: Defaults
     logging: LoggingConfig
+    storage: StorageConfig
     llm: dict
     raw: dict
 
@@ -52,6 +62,7 @@ def load_settings() -> Settings:
 
     defaults = config.get("defaults", {})
     logging_cfg = config.get("logging", {})
+    storage_cfg = config.get("storage", {})
     return Settings(
         defaults=Defaults(
             role_resumes=dict(defaults.get("role_resumes", {})),
@@ -69,6 +80,13 @@ def load_settings() -> Settings:
             action_log_path=logging_cfg.get("debug_click_log_path", "seekbot_actions.log"),
             csv_log_path=logging_cfg.get("csv_log_path", "seekbot_jobs.csv"),
             question_memory_csv_path=logging_cfg.get("question_memory_csv_path", "seekbot_qa_memory.csv"),
+        ),
+        storage=StorageConfig(
+            backend=str(storage_cfg.get("backend", "postgres") or "postgres").strip().lower(),
+            dsn=str(storage_cfg.get("dsn", "") or "").strip(),
+            dsn_env=str(storage_cfg.get("dsn_env", "SEEKBOT_POSTGRES_DSN") or "SEEKBOT_POSTGRES_DSN").strip(),
+            fallback_to_csv=bool(storage_cfg.get("fallback_to_csv", True)),
+            vector_dims=int(storage_cfg.get("vector_dims", 384)),
         ),
         llm=dict(config.get("llm", {})),
         raw=config,
