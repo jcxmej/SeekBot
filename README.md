@@ -287,7 +287,7 @@ Example:
 export SEEKBOT_POSTGRES_DSN='postgresql://USER@127.0.0.1:5432/seekbot'
 ```
 
-SeekBot creates the schema automatically on startup from [schema.sql](/Users/jaffinmk/Downloads/SeekBot-master/seekbot/storage/schema.sql).
+SeekBot creates the schema automatically on startup from [schema.sql](seekbot/storage/schema.sql).
 
 If you want a truly clean Postgres state for testing, set:
 
