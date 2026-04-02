@@ -31,6 +31,7 @@ class StorageConfig:
     dsn: str
     dsn_env: str
     fallback_to_csv: bool
+    bootstrap_from_csv: bool
     vector_dims: int
 
 
@@ -86,6 +87,7 @@ def load_settings() -> Settings:
             dsn=str(storage_cfg.get("dsn", "") or "").strip(),
             dsn_env=str(storage_cfg.get("dsn_env", "SEEKBOT_POSTGRES_DSN") or "SEEKBOT_POSTGRES_DSN").strip(),
             fallback_to_csv=bool(storage_cfg.get("fallback_to_csv", True)),
+            bootstrap_from_csv=bool(storage_cfg.get("bootstrap_from_csv", True)),
             vector_dims=int(storage_cfg.get("vector_dims", 384)),
         ),
         llm=dict(config.get("llm", {})),

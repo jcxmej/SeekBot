@@ -68,7 +68,7 @@ class OllamaHTTPProvider(BaseLLMProvider):
 
     def generate(self, prompt: str, llm_cfg: dict) -> str:
         payload = {
-            "model": llm_cfg.get("model", "llama3.1:8b"),
+            "model": llm_cfg.get("model", "qwen3:8b"),
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": llm_cfg.get("temperature", 0.1)},
@@ -88,7 +88,7 @@ class OllamaHTTPProvider(BaseLLMProvider):
             timeout=llm_cfg.get("timeout_s", 45),
         )
         return client.chat.completions.create(
-            model=llm_cfg.get("model", "gemma3"),
+            model=llm_cfg.get("model", "qwen3:8b"),
             messages=[{"role": "user", "content": prompt}],
             response_model=response_model,
             **_temperature_kwargs(llm_cfg),

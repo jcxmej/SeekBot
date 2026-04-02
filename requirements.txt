@@ -8,3 +8,4 @@ anthropic
 instructor
 sentence-transformers
 psycopg[binary]
+langgraph

@@ -262,15 +262,3 @@ class QuestionMemoryStore:
         if removed:
             self._write_all()
         return removed
-
-    def record_application_event(
-        self,
-        *,
-        kind: str,
-        question_text: str,
-        options: list[str] | None,
-        resolution: dict | None,
-        final_value: str | None,
-        status: str,
-    ) -> None:
-        return None

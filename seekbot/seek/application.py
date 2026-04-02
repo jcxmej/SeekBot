@@ -24,6 +24,11 @@ class ApplicationFlow:
         if self.action_logger:
             self.action_logger.info(message)
 
+    def _log_stage(self, message: str, *args) -> None:
+        logging.info(message, *args)
+        if self.run_logger:
+            self.run_logger.info(message, *args)
+
     def _body_text(self) -> str:
         try:
             return self.page.locator("body").inner_text(timeout=4000)
@@ -80,8 +85,6 @@ class ApplicationFlow:
                     button.click(force=True, timeout=3000)
                     self.page.wait_for_timeout(600)
                     self._log_action(f"button_click:{kind}:{strategy}:{label[:80]}")
-                    if self.run_logger:
-                        self.run_logger.info("Button click: kind=%s strategy=%s label=%r", kind, strategy, label[:120])
                     return True
                 except Exception as exc:
                     last_error = exc
@@ -641,6 +644,7 @@ class ApplicationFlow:
 
     def _advance_continue(self, *, intro_must_clear: bool = False) -> tuple[bool, str]:
         before = self._page_signature()
+        self._log_stage("Application stage: continuing to the next page")
         if not self._click_button("continue"):
             return False, "continue_button_not_found"
         return self._wait_for_navigation(before, intro_must_clear=intro_must_clear)
@@ -650,6 +654,7 @@ class ApplicationFlow:
         if self.run_logger and accepted:
             self.run_logger.info("Review consent count accepted: %d", accepted)
         before_url = self.page.url
+        self._log_stage("Application stage: submitting application")
         if not self._click_button("submit"):
             return False, "submit_button_not_found"
         try:
@@ -684,16 +689,30 @@ class ApplicationFlow:
         return False, "submit_not_confirmed"
 
     def apply(self, job: JobDetails, choice: ResumeChoice, *, dry_run: bool = False) -> tuple[bool, str]:
+        def fail(reason: str) -> tuple[bool, str]:
+            self._log_stage("Application failed: title=%s reason=%s", job.title, reason)
+            return False, reason
+
+        def succeed(reason: str) -> tuple[bool, str]:
+            self._log_stage("Application success: title=%s reason=%s", job.title, reason)
+            return True, reason
+
         if dry_run:
-            return True, "dry_run"
+            return succeed("dry_run")
         apply_url = f"{job.url.rstrip('/')}/apply"
+        self._log_stage("Application stage: opening apply page for %s", job.title)
         self.page.goto(apply_url, wait_until="domcontentloaded")
         if not is_seek_domain_url(self.page.url):
-            return False, "external_redirect"
+            return fail("external_redirect")
         if self.already_applied_notice():
-            return False, "already_applied"
+            return fail("already_applied")
 
+        self._log_stage("Application stage: generating cover letter for %s", job.title)
         cover_letter_text = generate_cover_letter(choice.resume_text, f"{job.title}\n{job.description}", self.config)
+        if cover_letter_text:
+            self._log_stage("Application stage: cover letter ready for %s", job.title)
+        else:
+            self._log_stage("Application stage: no cover letter generated for %s", job.title)
         if self.run_logger:
             if cover_letter_text:
                 self.run_logger.info("Cover letter generated: chars=%d preview=%r", len(cover_letter_text), cover_letter_text[:250])
@@ -701,12 +720,13 @@ class ApplicationFlow:
                 self.run_logger.info("Cover letter generated: none")
 
         if self._is_intro_page():
+            self._log_stage("Application stage: preparing intro page for %s", job.title)
             if self._intro_resume_present():
                 ok, reason = self._ensure_resume(choice.resume_path)
                 if self.run_logger:
                     self.run_logger.info("Document handling: target_resume=%s success=%s action=%s", choice.resume_path, ok, reason)
                 if not ok:
-                    return False, reason
+                    return fail(reason)
             if self._intro_cover_letter_present():
                 ok, reason = self._ensure_cover_letter(cover_letter_text)
                 if self.run_logger:
@@ -717,59 +737,58 @@ class ApplicationFlow:
                         len(cover_letter_text or ""),
                     )
                 if not ok:
-                    return False, reason
+                    return fail(reason)
 
             if self._intro_resume_present() and not self._verify_resume(choice.resume_path):
-                return False, "intro_resume_verification_failed"
+                return fail("intro_resume_verification_failed")
             if self._intro_cover_letter_present() and not self._verify_cover_letter(cover_letter_text):
-                return False, "intro_cover_letter_verification_failed"
+                return fail("intro_cover_letter_verification_failed")
 
             advanced, detail = self._advance_continue(intro_must_clear=True)
             if not advanced:
                 if self.run_logger and detail:
                     self.run_logger.info("Validation errors: %s", detail)
-                return False, "validation_errors" if "Before you can continue" in detail else detail
+                return fail("validation_errors" if "Before you can continue" in detail else detail)
+            self._log_stage("Application stage: intro page completed for %s", job.title)
 
         for attempt in range(1, 10):
             if self._submit_completion_detected():
-                return True, "submitted"
+                return succeed("submitted")
 
             if self._is_intro_page():
                 if self.run_logger:
                     self.run_logger.info("Unexpected return to intro page on attempt=%d", attempt)
-                return False, "returned_to_intro_page"
+                return fail("returned_to_intro_page")
 
             if self._is_final_review_page():
-                if self.run_logger:
-                    self.run_logger.info("Final review page detected on attempt=%d", attempt)
+                self._log_stage("Application stage: final review page reached for %s", job.title)
                 advanced, detail = self._advance_submit()
                 if advanced:
-                    return True, "submitted"
+                    return succeed("submitted")
                 if not advanced:
                     if self.run_logger and detail:
                         self.run_logger.info("Validation errors: %s", detail)
-                    return False, "validation_errors" if "Before you can continue" in detail else detail
+                    return fail("validation_errors" if "Before you can continue" in detail else detail)
                 continue
 
+            self._log_stage("Application stage: filling questionnaire page for %s", job.title)
             fill_questionnaire(
                 self.page,
                 self.config,
                 choice.resume_text,
-                f"{job.title}\n{job.description}",
                 self.run_logger,
                 question_store=self.question_store,
             )
 
             if self._is_final_review_page():
-                if self.run_logger:
-                    self.run_logger.info("Final review page detected after questionnaire on attempt=%d", attempt)
+                self._log_stage("Application stage: final review page reached for %s", job.title)
                 advanced, detail = self._advance_submit()
                 if advanced:
-                    return True, "submitted"
+                    return succeed("submitted")
                 if not advanced:
                     if self.run_logger and detail:
                         self.run_logger.info("Validation errors: %s", detail)
-                    return False, "validation_errors" if "Before you can continue" in detail else detail
+                    return fail("validation_errors" if "Before you can continue" in detail else detail)
                 continue
 
             if self._continue_present():
@@ -777,19 +796,19 @@ class ApplicationFlow:
                 if not advanced:
                     if self.run_logger and detail:
                         self.run_logger.info("Validation errors: %s", detail)
-                    return False, "validation_errors" if "Before you can continue" in detail else detail
+                    return fail("validation_errors" if "Before you can continue" in detail else detail)
                 continue
 
             if self._submit_present():
                 advanced, detail = self._advance_submit()
                 if advanced:
-                    return True, "submitted"
+                    return succeed("submitted")
                 if not advanced:
                     if self.run_logger and detail:
                         self.run_logger.info("Validation errors: %s", detail)
-                    return False, "validation_errors" if "Before you can continue" in detail else detail
+                    return fail("validation_errors" if "Before you can continue" in detail else detail)
                 continue
 
             if self._submit_completion_detected():
-                return True, "submitted"
-        return False, "apply_flow_failed"
+                return succeed("submitted")
+        return fail("apply_flow_failed")

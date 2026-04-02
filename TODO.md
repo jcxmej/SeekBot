@@ -2,11 +2,9 @@
 
 ## Next
 
-- Improve question extraction so the LLM sees the real employer question instead of DOM noise.
-- Broaden questionnaire widget support, especially richer custom controls beyond native inputs/selects.
+- Extend widget adapters beyond native controls, especially richer custom combobox/button-based controls.
 - Add Playwright smoke tests for search extraction, intro-page asset handling, questionnaire filling, and submit flow.
 - Add optional screenshot capture on failed applications.
-- Clean up the redundant questionnaire event duplication between generic run logs and `qa_memory`.
 
 ## Planned
 
@@ -22,13 +20,14 @@
 - Evaluate whether the current global matching taxonomy should stay global or move to per-role keyword lists after more real application runs.
 - Add embedding-based questionnaire memory reuse later instead of string-based fuzzy question matching.
 - Replace the module-level LLM logger global with explicit dependency injection or a small LLM service object.
-- Add DB-backed eval queries instead of introducing a separate `seekbot_evals.csv`.
+- Expand the DB-backed eval report beyond the initial `scripts/eval_report.py` query set when patterns emerge.
 - Add explicit provider-level cost controls and feature toggles so scarce hosted credits can be reserved for questionnaire answering only.
+- Expand LangGraph from per-job orchestration to broader run-level orchestration only if the current job graph proves too limiting.
+- Document and handle the first-run cold-start state where `qa_memory` is empty and questionnaire answering has no prior verified memory yet.
 
 ## Deferred
 
 - More aggressive handling of prefilled employer-question answers. Current behavior intentionally leaves prefilled answers in place unless the page requires intervention.
-- Full LangGraph orchestration rewrite. Valuable, but after the storage/questionnaire foundations are more stable.
 
 ## Out Of Scope For Now
 

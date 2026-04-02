@@ -31,6 +31,9 @@ def configure_logging(logging_config: LoggingConfig) -> BotLoggers:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+    logging.getLogger("transformers").setLevel(logging.WARNING)
     return BotLoggers(
         run=_setup_file_logger("seekbot.run", logging_config.run_log_path),
         llm=_setup_file_logger("seekbot.llm", logging_config.llm_log_path),

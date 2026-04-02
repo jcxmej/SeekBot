@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS qa_memory_question_hash_idx ON qa_memory (question_ha
 CREATE INDEX IF NOT EXISTS qa_memory_verified_idx ON qa_memory (verified);
 CREATE INDEX IF NOT EXISTS qa_memory_last_seen_idx ON qa_memory (last_seen DESC);
 CREATE INDEX IF NOT EXISTS qa_memory_embedding_idx
-ON qa_memory USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+ON qa_memory USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
 
 CREATE TABLE IF NOT EXISTS run_logs (
     id BIGSERIAL PRIMARY KEY,

@@ -7,6 +7,8 @@ This file records the current project decisions, constraints, and deferred ideas
 - SeekBot currently supports **Seek Quick Apply only**.
 - External apply flows and non-Quick Apply flows are out of scope for the active runtime.
 - One configured LLM provider is used per run. There is no in-run provider fallback/orchestration layer.
+- The outer search-page loop remains simple and imperative.
+- Individual job processing now runs through a LangGraph state machine.
 
 ## Configuration
 
@@ -36,8 +38,8 @@ This file records the current project decisions, constraints, and deferred ideas
 
 ## LLM Behavior
 
-- The default active local model is currently `gemma3`.
-- The default hosted/template provider is currently Hugging Face using `deepseek-ai/DeepSeek-V3-0324`.
+- The default active local model is currently `qwen3:8b` on Ollama.
+- Hugging Face using `deepseek-ai/DeepSeek-V3-0324` remains available as a hosted provider when needed.
 - Resume text is always sent in full to the LLM. Resume truncation is intentionally removed.
 - `question_issue` is a debug signal only. It should be logged, but it must not block answering by itself.
 - The LLM layer now uses schema-validated structured generation with Pydantic models and `instructor`.
@@ -56,14 +58,20 @@ This file records the current project decisions, constraints, and deferred ideas
   3. LLM from resume plus verified prior Q&A context
   4. user if confidence is too low
 - The questionnaire-answering prompt should not use the JD. It should use the resume plus verified prior Q&A memory only.
+- Questionnaire extraction is now block-first:
+  - start from visible controls
+  - group them into question blocks
+  - extract one clean question and option set per block
+  - answer/apply once per block
 - Only answers with `confidence > 0.85` should be auto-accepted.
 - Answers with `confidence <= 0.85` should prompt the user.
 - Verified memory means a human accepted or provided the answer.
 - Exact verified memory auto-reuses directly.
 - Similar verified memory may auto-apply when its confidence is above the active threshold. Otherwise it should be presented to the user for confirmation.
 - Native multi-select questions should use a dedicated multi-option LLM prompt and apply every supported option the model returns.
-- Question extraction is a known weakness; DOM noise can still leak into the extracted question.
+- Block-first extraction reduces DOM noise substantially, but some custom widgets can still need explicit adapters.
 - The old static `question_answers` questionnaire dictionary is removed from the active questionnaire flow.
+- This means a fresh install with empty `qa_memory` starts from a colder state: early questionnaire answers rely on the resume until verified memory is built through use.
 - Questionnaire memory may store unverified LLM answers as the latest state for that exact canonical question, but read paths must stay restricted to verified rows for direct reuse and trusted prompt context.
 - String-based fuzzy memory reuse was intentionally removed as an auto-answer path. If non-exact memory reuse expands later, it should stay confirmation-gated and eventually use embeddings rather than lexical fuzzy matching.
 
@@ -73,7 +81,9 @@ This file records the current project decisions, constraints, and deferred ideas
 - Jobs and Q&A memory are now primarily stored in Postgres, with CSV retained only as fallback/bootstrap.
 - The primary storage path should stay behind the existing store-style boundary, not leak into Playwright/browser code.
 - Existing CSV files are retained as fallback/bootstrap sources, not as the preferred runtime store.
+- CSV bootstrap into Postgres should be configurable so intentionally clean database tests are possible without automatic legacy import.
 - The Q&A memory store records the final answer actually applied or observed on the page, not every intermediate guess.
+- `qa_memory` is the canonical questionnaire state store. Generic run logs should not duplicate questionnaire rows.
 - Only verified answers should be reused directly or included as trusted Q&A context for the LLM.
 - Low-confidence edge cases still need a cleaner separation between:
   - auto-accept threshold
@@ -94,6 +104,14 @@ This file records the current project decisions, constraints, and deferred ideas
   - resume selection/upload
   - cover letter generation/fill
   - verification before continuing
+- Per-job orchestration is now explicit:
+  - fetch details
+  - classify skip vs quick apply
+  - choose resume
+  - gate by compatibility
+  - enrich contact
+  - apply
+  - persist result
 - Submit success is strict: Seek `/apply/success` is the success signal.
 - Final review consent/privacy/terms checkboxes should be auto-ticked.
 - `Show strong interest` should be ignored.
@@ -101,7 +119,7 @@ This file records the current project decisions, constraints, and deferred ideas
 ## Known Practical Limitations
 
 - Common native questionnaire controls are handled first: text inputs, textareas, radios, checkboxes, and selects.
-- Custom widgets and multi-select controls are not fully handled yet.
+- Current custom-widget support covers common ARIA radiogroups and listboxes, but richer combobox/button-based widgets are not fully handled yet.
 - Prefilled questionnaire answers are intentionally left in place for now unless the page requires intervention.
 - External job links should be logged cleanly, but external flow itself is not part of the active runtime.
 
@@ -118,9 +136,9 @@ This file records the current project decisions, constraints, and deferred ideas
 
 ## Planned Next Directions
 
-- Improve question extraction so the LLM sees the real employer question.
-- Add support for custom widgets and multi-selects.
+- Expand widget adapters for richer custom controls after more real runs.
 - Refine the hybrid matcher, including weighting, thresholds, and better semantic memory reuse.
 - Move local persistence from CSV/files to Postgres with `pgvector`.
 - Use DB queries as the first eval/reporting layer instead of adding a separate eval CSV.
+- The initial DB-backed eval/report layer is a small script over `jobs` and `qa_memory`, not a separate evaluation subsystem.
 - Add better automated test coverage.

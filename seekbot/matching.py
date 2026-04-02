@@ -1,3 +1,5 @@
+import contextlib
+import io
 import logging
 import math
 import re
@@ -59,7 +61,8 @@ def _load_embedding_model(model_name: str):
     from sentence_transformers import SentenceTransformer
 
     try:
-        model = SentenceTransformer(model_name)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            model = SentenceTransformer(model_name)
         _EMBEDDING_MODELS[model_name] = model
         return model
     except Exception:
@@ -74,7 +77,8 @@ def semantic_embedding(text: str, config: dict) -> tuple[float, ...]:
     model_name = matching_cfg.get("embedding_model", "all-MiniLM-L6-v2")
     try:
         model = _load_embedding_model(model_name)
-        vector = model.encode(text or "", normalize_embeddings=True, show_progress_bar=False)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            vector = model.encode(text or "", normalize_embeddings=True, show_progress_bar=False)
         return tuple(float(item) for item in vector.tolist())
     except Exception as exc:
         if model_name not in _LOGGED_EMBEDDING_FAILURES:

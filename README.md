@@ -52,6 +52,7 @@ That is not just a v1 limitation. It is the current product boundary. External a
   - questionnaire flow changed to memory-first, with resume-only LLM answering
   - Hugging Face added as a first-class hosted provider
   - API-backed cover letters, contact extraction, and structured questionnaire answers
+  - per-job LangGraph orchestration for explicit fetch/classify/score/apply/persist transitions
 
 ## Design Overview
 
@@ -61,6 +62,7 @@ SeekBot is split into a few clear layers:
 - `seekbot/matching.py`: semantic JD-led resume matching with keyword explanations
 - `seekbot/llm/`: prompt construction, structured response handling, schemas, and provider adapters
 - `seekbot/storage/`: reusable employer-question memory and deduplicated job result index
+- `seekbot/job_graph.py`: explicit LangGraph state machine for per-job orchestration
 - local Postgres is now the primary storage backend for job outcomes and Q&A memory
 - CSV persistence remains only as a fallback/bootstrap path when Postgres is not configured or unavailable
 - `seekbot/domain.py`: shared workflow data structures
@@ -111,6 +113,70 @@ This creates a simple self-improving loop:
 - the user is the teacher
 - the local memory becomes the reusable answer store
 
+### Why LangGraph
+
+The older runtime handled each job through one long imperative chain inside `workflow.py`. It worked, but the actual states were implicit.
+
+The current V2 runtime keeps the outer search-page loop simple, but each individual job now moves through an explicit LangGraph state machine:
+- fetch details
+- classify quick apply / skip
+- choose resume
+- gate by compatibility
+- enrich contact
+- apply
+- persist result
+
+That makes the job lifecycle easier to reason about, easier to extend with retries or human checkpoints later, and easier to log as real state transitions instead of scattered branching.
+
+### Flow Before And After
+
+Before:
+
+```mermaid
+flowchart TD
+    A["Start run"] --> B["Open search page"]
+    B --> C["Loop job cards"]
+    C --> D["Fetch job details"]
+    D --> E{"Quick Apply?"}
+    E -- "No" --> F["Skip + record"]
+    E -- "Yes" --> G["Score job + choose resume"]
+    G --> H{"Compatibility enough?"}
+    H -- "No" --> I["Skip + record"]
+    H -- "Yes" --> J["Generate cover letter/contact"]
+    J --> K["Open apply flow"]
+    K --> L["Fill intro page"]
+    L --> M["Fill questionnaire"]
+    M --> N{"Low confidence?"}
+    N -- "Yes" --> O["Ask user inline"]
+    N -- "No" --> P["Continue"]
+    O --> P
+    P --> Q["Final review"]
+    Q --> R["Submit"]
+    R --> S{"Success?"}
+    S -- "Yes" --> T["Record applied"]
+    S -- "No" --> U["Record failure"]
+    F --> C
+    I --> C
+    T --> C
+    U --> C
+```
+
+After:
+
+```mermaid
+flowchart TD
+    A["Search page loop"] --> B["JobGraph: fetch_details"]
+    B --> C["JobGraph: classify_job"]
+    C -- "already applied / non-quick / external" --> D["JobGraph: persist_result"]
+    C -- "quick apply" --> E["JobGraph: choose_resume"]
+    E --> F["JobGraph: gate_compatibility"]
+    F -- "below threshold" --> D
+    F -- "good fit" --> G["JobGraph: enrich_contact"]
+    G --> H["JobGraph: apply_job"]
+    H --> D
+    D --> I["Next card"]
+```
+
 ## Repository Layout
 
 ```text
@@ -118,6 +184,7 @@ seekbot/
   __main__.py
   cli.py
   workflow.py
+  job_graph.py
   settings.py
   logging_utils.py
   domain.py
@@ -146,6 +213,7 @@ seekbot/
     application.py
 scripts/
   debug_llm_question.py
+  eval_report.py
 seek_config.py
 seek_config_local.py
 SeekBot.py
@@ -190,6 +258,7 @@ Edit `seek_config_local.py`:
 - `storage`
   - Postgres backend settings
   - either set `storage.dsn` or export `SEEKBOT_POSTGRES_DSN`
+  - `bootstrap_from_csv = True` imports legacy CSV data into empty Postgres tables on first use
 - `llm`
   - provider, model, URL, API env vars, and signature name
   - for Hugging Face, set `api_key_env` to `HF_TOKEN`
@@ -201,6 +270,35 @@ The loader uses:
 
 1. `seek_config_local`
 2. `seek_config`
+
+## Postgres Setup
+
+Minimal local setup:
+
+1. create a local database, for example `seekbot`
+2. enable `pgvector`
+3. set a DSN with either:
+   - `storage.dsn` in `seek_config_local.py`
+   - or `SEEKBOT_POSTGRES_DSN` in your shell
+
+Example:
+
+```bash
+export SEEKBOT_POSTGRES_DSN='postgresql://USER@127.0.0.1:5432/seekbot'
+```
+
+SeekBot creates the schema automatically on startup from [schema.sql](/Users/jaffinmk/Downloads/SeekBot-master/seekbot/storage/schema.sql).
+
+If you want a truly clean Postgres state for testing, set:
+
+```python
+"storage": {
+    "backend": "postgres",
+    "bootstrap_from_csv": False,
+}
+```
+
+That disables the legacy CSV bootstrap import.
 
 ## Running The Bot
 
@@ -224,6 +322,10 @@ What to expect:
 - job searches begin
 - low-confidence employer questions pause in the terminal for your answer
 
+## First Run
+
+On a fresh install with empty `qa_memory`, questionnaire answering uses the resume alone until verified memory is built up from your confirmations. The first run is therefore less informed than later runs.
+
 ## Outputs
 
 SeekBot writes several local runtime files:
@@ -239,7 +341,7 @@ SeekBot writes several local runtime files:
 - `seekbot_qa_memory.csv`
   - CSV fallback / legacy bootstrap source for employer-question memory
 - `.seekbot-postgres/`
-  - optional local Postgres cluster data directory if you use the project-local database setup
+  - optional local Postgres cluster data directory only if you choose to run a project-local Postgres instance from inside the repo
 
 The primary persistent storage path is now Postgres for jobs and Q&A memory. These local files are still useful as fallback or bootstrap artifacts and should not be committed.
 
@@ -258,6 +360,30 @@ python scripts/debug_llm_question.py \
 ```
 
 It saves the rendered prompt, JD, context, raw response, and parsed response under `debug_runs/`.
+
+## DB Eval Report
+
+Use the small Postgres-backed report script to inspect current runtime outcomes and questionnaire memory:
+
+```bash
+python scripts/eval_report.py
+```
+
+Optional:
+
+```bash
+python scripts/eval_report.py --top 15
+```
+
+It reports:
+
+- job status counts
+- failed application reasons
+- role-level apply rates
+- verified vs unverified Q&A memory counts
+- most reused Q&A memory rows
+- current unverified Q&A rows
+- wording variants across remembered questions
 
 ## Supported LLM Providers
 
@@ -282,7 +408,8 @@ Notes:
 
 - The project only supports Seek Quick Apply flows.
 - Questionnaire handling currently focuses on common native controls first: text inputs, textareas, radios, checkboxes, and selects.
-- Question extraction can still be noisy on some custom DOM structures. This is the main known logic weakness in the employer-question flow today.
+- Employer-question extraction is now block-first, which removes a lot of DOM noise by resolving one real question block at a time instead of scraping each field independently.
+- Some richer custom widgets can still need explicit adapters, especially combobox/button-based controls.
 - Prefilled questionnaire answers are currently left in place rather than being aggressively overwritten if they differ from the newly resolved answer.
 - Matching currently uses a hybrid semantic scorer: embeddings for selection, taxonomy keywords for explanation. The taxonomy is still global for now.
 - The first semantic matching run needs the embedding model available locally. If it is not cached yet and the machine is offline, SeekBot falls back to lexical matching.
@@ -313,12 +440,9 @@ These are machine-local state files, not source code.
 
 The next version should focus on:
 
-- better question extraction from messy DOM structures
-- broader support for custom widgets and multi-select controls
-- hybrid resume matching: keep deterministic matching but add semantic similarity carefully without losing explainability
-- local Postgres + `pgvector` as the next persistence layer instead of flat CSVs and debug folders
-- DB-backed semantic employer-question memory instead of a separate ChromaDB step
-- gradual migration toward structured LLM outputs using schema-validated models
+- broader support for richer custom widgets beyond the current native/ARIA handlers
+- expanding the DB-backed eval/report layer beyond the initial query script
+- more targeted matching calibration after more real runs
 - stronger automated test coverage
 
 See `TODO.md` for the current short list.

@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import json
 import logging
 import os
 from pathlib import Path
@@ -58,7 +56,16 @@ def _question_embedding(question_text: str, options: list[str] | None, config: d
 
 
 class PostgresDB:
-    def __init__(self, dsn: str, *, vector_dims: int, config: dict, jobs_csv_path: str, qa_csv_path: str):
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        vector_dims: int,
+        config: dict,
+        jobs_csv_path: str,
+        qa_csv_path: str,
+        bootstrap_from_csv: bool,
+    ):
         try:
             import psycopg
             from psycopg.rows import dict_row
@@ -69,7 +76,8 @@ class PostgresDB:
         self.conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
         self.config = config
         self._ensure_schema(vector_dims)
-        self._bootstrap_from_csv(jobs_csv_path=jobs_csv_path, qa_csv_path=qa_csv_path)
+        if bootstrap_from_csv:
+            self._bootstrap_from_csv(jobs_csv_path=jobs_csv_path, qa_csv_path=qa_csv_path)
 
     def _ensure_schema(self, vector_dims: int) -> None:
         schema_path = Path(__file__).with_name("schema.sql")
@@ -447,6 +455,7 @@ class PostgresQuestionMemoryStore:
         embedding = _vector_literal(_question_embedding(question_text, options, self.config))
         target_options = options_key(options)
         target_key = question_lookup_key(question_text, options)
+        min_similarity = 0.55
         with self.db.conn.cursor() as cur:
             if embedding:
                 cur.execute(
@@ -462,6 +471,7 @@ class PostgresQuestionMemoryStore:
                     FROM qa_memory
                     WHERE memory_key <> %s
                       AND verified = TRUE
+                      AND 1 - (embedding <=> %s::vector) >= %s
                     ORDER BY
                         CASE WHEN options_signature = %s AND %s <> '' THEN 1 ELSE 0 END DESC,
                         similarity DESC NULLS LAST,
@@ -469,7 +479,7 @@ class PostgresQuestionMemoryStore:
                         last_seen DESC
                     LIMIT %s
                     """,
-                    (embedding, target_key, target_options, target_options, limit),
+                    (embedding, target_key, embedding, min_similarity, target_options, target_options, limit),
                 )
             else:
                 cur.execute(
@@ -491,9 +501,21 @@ class PostgresQuestionMemoryStore:
                         last_seen DESC
                     LIMIT %s
                     """,
-                    (target_key, target_options, target_options, limit),
+                    (target_key, target_options, target_options, max(limit * 5, 20)),
                 )
             rows = cur.fetchall()
+        if not embedding:
+            filtered_rows: list[dict] = []
+            target_question = normalize_question(question_text)
+            for row in rows:
+                similarity = SequenceMatcher(None, target_question, normalize_question(row.get("question_text", ""))).ratio()
+                if target_options and options_key((row.get("options", "") or "").split(" | ")) == target_options:
+                    similarity += 0.2
+                if similarity >= min_similarity:
+                    filtered = dict(row)
+                    filtered["similarity"] = round(similarity, 4)
+                    filtered_rows.append(filtered)
+            rows = filtered_rows[:limit]
         if not rows:
             return "N/A"
         lines = ["question_text | options | answer | answered_by | confidence | verified"]
@@ -516,38 +538,6 @@ class PostgresQuestionMemoryStore:
             cur.execute("DELETE FROM qa_memory WHERE verified = FALSE")
             return int(cur.rowcount or 0)
 
-    def record_application_event(
-        self,
-        *,
-        kind: str,
-        question_text: str,
-        options: list[str] | None,
-        resolution: dict | None,
-        final_value: str | None,
-        status: str,
-    ) -> None:
-        payload = {
-            "kind": kind,
-            "question_text": question_text or "",
-            "options": normalize_options(options),
-            "status": status,
-            "final_value": final_value or "",
-            "resolved_answer": (resolution or {}).get("answer") or "",
-            "source": (resolution or {}).get("source") or "",
-            "confidence": (resolution or {}).get("confidence"),
-            "reason": (resolution or {}).get("reason") or "",
-            "question_issue": (resolution or {}).get("question_issue") or "",
-        }
-        with self.db.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO run_logs (level, message, metadata)
-                VALUES (%s, %s, %s::jsonb)
-                """,
-                ("INFO", "question_application", json.dumps(payload)),
-            )
-
-
 def create_storage(settings):
     if settings.storage.backend != "postgres":
         return CsvJobStore(settings.logging.csv_log_path), QuestionMemoryStore(settings.logging.question_memory_csv_path)
@@ -567,6 +557,7 @@ def create_storage(settings):
             config=settings.raw,
             jobs_csv_path=settings.logging.csv_log_path,
             qa_csv_path=settings.logging.question_memory_csv_path,
+            bootstrap_from_csv=settings.storage.bootstrap_from_csv,
         )
         logging.info("Using Postgres storage backend.")
         return PostgresJobStore(db), PostgresQuestionMemoryStore(db, settings.raw)

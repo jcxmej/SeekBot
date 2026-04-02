@@ -13,10 +13,10 @@ from playwright.sync_api import sync_playwright
 
 from seekbot.llm import build_question_prompt, generate_with_current_provider, parse_question_response
 from seekbot.resume_parser import extract_resume_text
-from seekbot.seek.forms import build_qa_memory_table
+from seekbot.seek.forms import _build_qa_memory_table
 from seekbot.seek.search import fetch_job_details, normalize_job_url
 from seekbot.settings import load_settings
-from seekbot.storage import QuestionMemoryStore
+from seekbot.storage import create_storage
 
 
 def _job_url_from_input(url: str) -> str:
@@ -76,9 +76,9 @@ def main() -> None:
         details = fetch_job_details(page, target_job_url)
         browser.close()
 
-    question_store = QuestionMemoryStore(settings.logging.question_memory_csv_path)
+    _, question_store = create_storage(settings)
     options = args.option or None
-    qa_memory_table = build_qa_memory_table(config, question_store, args.question, options)
+    qa_memory_table = _build_qa_memory_table(question_store, args.question, options)
     prompt = build_question_prompt(
         resume_text,
         args.question,

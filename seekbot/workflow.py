@@ -1,15 +1,15 @@
 import logging
 import re
-from dataclasses import replace
 
-from seekbot.llm import extract_contact, set_logger
+from seekbot.job_graph import JobGraphRunner
+from seekbot.llm import set_logger
 from seekbot.logging_utils import BotLoggers
 from seekbot.matching import compute_compatibility, cosine_similarity, extract_taxonomy_keywords, semantic_embedding
-from seekbot.domain import ApplicationRecord, CompatibilityResult, ContactInfo, ResumeChoice, ResumeProfile, SearchPlan
+from seekbot.domain import CompatibilityResult, ResumeChoice, ResumeProfile, SearchPlan
 from seekbot.resume_parser import extract_resume_text
 from seekbot.seek.application import ApplicationFlow
 from seekbot.seek.browser import SeekBrowser
-from seekbot.seek.search import build_search_urls, fetch_job_details, find_next_page_url, gather_job_cards
+from seekbot.seek.search import build_search_urls, find_next_page_url, gather_job_cards
 from seekbot.settings import Settings
 from seekbot.storage import create_storage
 
@@ -152,57 +152,6 @@ def choose_best_resume(search_role: str, job_text: str, profiles: list[ResumePro
     )
 
 
-def _merge_contact(original: ContactInfo, llm_contact: dict | None) -> ContactInfo:
-    if not llm_contact:
-        return original
-    return ContactInfo(
-        name=original.name or llm_contact.get("name", ""),
-        email=original.email or llm_contact.get("email", ""),
-        phone=original.phone or llm_contact.get("phone", ""),
-    )
-
-
-def _extract_seek_job_id(url: str) -> str:
-    match = re.search(r"/job/(\d+)", url or "")
-    return match.group(1) if match else ""
-
-
-def _make_record(
-    *,
-    status: str,
-    reason: str,
-    details,
-    plan: SearchPlan,
-    choice: ResumeChoice | None,
-    compatibility_threshold: float,
-    dry_run: bool,
-    external: bool,
-    job_index: str,
-) -> ApplicationRecord:
-    compatibility = choice.compatibility if choice else None
-    return ApplicationRecord(
-        status=status,
-        reason=reason,
-        url=details.url,
-        title=details.title,
-        company=details.company,
-        location=details.location,
-        contact=details.contact,
-        external_url=details.external_url,
-        search_url=plan.search_url,
-        keyword=plan.keyword,
-        role_key=plan.role_key,
-        selected_resume_role=choice.selected_role if choice else "",
-        resume_path=choice.resume_path if choice else "",
-        quick_apply=details.quick_apply,
-        compatibility=compatibility,
-        compatibility_threshold=compatibility_threshold,
-        dry_run=dry_run,
-        external=external,
-        job_index=job_index,
-    )
-
-
 def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
     set_logger(loggers.llm)
     profiles = load_resume_profiles(settings, getattr(args, "resume", None))
@@ -276,6 +225,16 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
             action_logger=loggers.action,
             question_store=question_store,
         )
+        job_graph = JobGraphRunner(
+            config=settings.raw,
+            run_logger=loggers.run,
+            job_store=csv_store,
+            apply_flow=apply_flow,
+            profiles=profiles,
+            compatibility_threshold=args.compatibility_threshold,
+            dry_run=args.dry_run,
+            choose_best_resume_fn=choose_best_resume,
+        )
 
         applied = 0
         checked = 0
@@ -326,148 +285,9 @@ def run_bot(args, settings: Settings, loggers: BotLoggers) -> None:
                             card.url,
                             indexed.get("reason", ""),
                         )
-                    details = fetch_job_details(page, card.url)
-                    logging.info("Evaluating (%d): %s", checked, details.title)
-                    logging.info("Quick apply detected: %s", details.quick_apply)
-                    loggers.run.info("Evaluating (%d): %s", checked, details.title)
-                    loggers.run.info("Quick apply detected: %s", details.quick_apply)
-
-                    if apply_flow.already_applied_notice():
-                        csv_store.append(
-                            _make_record(
-                                status="already_applied",
-                                reason="page_shows_applied",
-                                details=details,
-                                plan=plan,
-                                choice=None,
-                                compatibility_threshold=args.compatibility_threshold,
-                                dry_run=args.dry_run,
-                                external=False,
-                                job_index=_extract_seek_job_id(details.url),
-                            )
-                        )
-                        continue
-
-                    if details.external_url and not details.quick_apply:
-                        csv_store.append(
-                            _make_record(
-                                status="skipped_external",
-                                reason="external_application",
-                                details=details,
-                                plan=plan,
-                                choice=None,
-                                compatibility_threshold=args.compatibility_threshold,
-                                dry_run=args.dry_run,
-                                external=True,
-                                job_index=_extract_seek_job_id(details.url),
-                            )
-                        )
-                        continue
-
-                    if not details.quick_apply:
-                        csv_store.append(
-                            _make_record(
-                                status="skipped_non_quick",
-                                reason="not_quick_apply",
-                                details=details,
-                                plan=plan,
-                                choice=None,
-                                compatibility_threshold=args.compatibility_threshold,
-                                dry_run=args.dry_run,
-                                external=False,
-                                job_index=_extract_seek_job_id(details.url),
-                            )
-                        )
-                        continue
-
-                    choice = choose_best_resume(plan.role_key, f"{details.title}\n{details.description}", profiles, settings.raw)
-                    logging.info(
-                        "Selected resume role: search_role=%s selected_resume_role=%s selection_scores=%s compatibility_scores=%s",
-                        choice.search_role,
-                        choice.selected_role,
-                        ", ".join(f"{role}={score:.3f}" for role, score in choice.selection_scores),
-                        ", ".join(f"{role}={score:.1f}" for role, score in choice.candidate_scores),
-                    )
-                    logging.info(
-                        "Compatibility score: %.1f/10 semantic=%.1f raw_cosine=%.3f keyword=%.1f matched=%s missing=%s",
-                        choice.compatibility.score,
-                        choice.compatibility.semantic_score,
-                        choice.compatibility.semantic_cosine,
-                        choice.compatibility.keyword_score,
-                        ", ".join(choice.compatibility.matched_keywords) or "-",
-                        ", ".join(choice.compatibility.missing_keywords) or "-",
-                    )
-                    loggers.run.info(
-                        "Selected resume role: search_role=%s selected_resume_role=%s selection_scores=%s compatibility_scores=%s",
-                        choice.search_role,
-                        choice.selected_role,
-                        ", ".join(f"{role}={score:.3f}" for role, score in choice.selection_scores),
-                        ", ".join(f"{role}={score:.1f}" for role, score in choice.candidate_scores),
-                    )
-                    loggers.run.info(
-                        "Compatibility score: %.1f/10 semantic=%.1f raw_cosine=%.3f keyword=%.1f matched=%s missing=%s",
-                        choice.compatibility.score,
-                        choice.compatibility.semantic_score,
-                        choice.compatibility.semantic_cosine,
-                        choice.compatibility.keyword_score,
-                        ", ".join(choice.compatibility.matched_keywords) or "-",
-                        ", ".join(choice.compatibility.missing_keywords) or "-",
-                    )
-                    loggers.run.info(
-                        "Compatibility extraction: job_keywords=%s resume_keywords=%s",
-                        ", ".join(choice.compatibility.job_keywords) or "-",
-                        ", ".join(choice.compatibility.resume_keywords) or "-",
-                    )
-
-                    if choice.compatibility.score <= args.compatibility_threshold:
-                        csv_store.append(
-                            _make_record(
-                                status="skipped_compatibility",
-                                reason="not_enough_compatibility_score",
-                                details=details,
-                                plan=plan,
-                                choice=choice,
-                                compatibility_threshold=args.compatibility_threshold,
-                                dry_run=args.dry_run,
-                                external=False,
-                                job_index=_extract_seek_job_id(details.url),
-                            )
-                        )
-                        continue
-
-                    if settings.llm.get("enabled") and details.description:
-                        details = replace(details, contact=_merge_contact(details.contact, extract_contact(details.description, settings.raw)))
-
-                    success, reason = apply_flow.apply(details, choice, dry_run=args.dry_run)
-                    if success:
+                    result = job_graph.process(plan, card, checked)
+                    if result.get("status") == "applied":
                         applied += 1
-                        csv_store.append(
-                            _make_record(
-                                status="applied",
-                                reason="success",
-                                details=details,
-                                plan=plan,
-                                choice=choice,
-                                compatibility_threshold=args.compatibility_threshold,
-                                dry_run=args.dry_run,
-                                external=False,
-                                job_index=_extract_seek_job_id(details.url),
-                            )
-                        )
-                    else:
-                        csv_store.append(
-                            _make_record(
-                                status="failed_apply",
-                                reason=reason,
-                                details=details,
-                                plan=plan,
-                                choice=choice,
-                                compatibility_threshold=args.compatibility_threshold,
-                                dry_run=args.dry_run,
-                                external=False,
-                                job_index=_extract_seek_job_id(details.url),
-                            )
-                        )
                 if not next_page_url:
                     break
                 page_url = next_page_url

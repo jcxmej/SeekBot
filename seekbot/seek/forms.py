@@ -1,9 +1,30 @@
+import logging
+from dataclasses import dataclass, field as dataclass_field
 import re
 import sys
+from typing import Any
 
 from playwright.sync_api import Page
 
 from seekbot.llm import answer_question
+
+
+@dataclass
+class QuestionBlock:
+    kind: str
+    question_text: str
+    options: list[str]
+    field: Any
+    items: list[tuple[Any, str]] = dataclass_field(default_factory=list)
+    allow_multiple: bool = False
+    debug_strategy: str = ""
+    key: str = ""
+
+
+def _log_progress(run_logger, message: str, *args) -> None:
+    logging.info(message, *args)
+    if run_logger:
+        run_logger.info(message, *args)
 
 
 def is_placeholder_answer(answer) -> bool:
@@ -293,6 +314,407 @@ def _check_checkbox(field) -> bool:
         return False
 
 
+def _element_dom_path(field) -> str:
+    try:
+        return field.evaluate(
+            """
+            el => {
+              const parts = [];
+              let cur = el;
+              while (cur && cur.nodeType === Node.ELEMENT_NODE && parts.length < 8) {
+                let part = cur.tagName.toLowerCase();
+                if (cur.id) {
+                  part += `#${cur.id}`;
+                  parts.unshift(part);
+                  break;
+                }
+                let index = 1;
+                let sib = cur;
+                while ((sib = sib.previousElementSibling)) {
+                  if (sib.tagName === cur.tagName) index += 1;
+                }
+                part += `:nth-of-type(${index})`;
+                parts.unshift(part);
+                cur = cur.parentElement;
+              }
+              return parts.join(' > ');
+            }
+            """
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _extract_question_from_container(field, options: list[str] | None = None) -> tuple[str, str]:
+    try:
+        payload = field.evaluate(
+            """
+            (el, optionTexts) => {
+              const normalize = text => (text || '')
+                .toLowerCase()
+                .replace(/[^a-z0-9 ]+/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+              const optionSet = new Set((optionTexts || []).map(normalize).filter(Boolean));
+              const ignoredExact = new Set([
+                'yes',
+                'no',
+                'upload a resume',
+                'select a resume',
+                'dont include a resume',
+                'upload a cover letter',
+                'write a cover letter',
+                'dont include a cover letter',
+                'show strong interest',
+              ]);
+              const ignoredContains = [
+                'show strong interest',
+                'make a strong impression',
+                'upload a resum',
+                'cover letter',
+                'coverletter',
+              ];
+
+              const chooseLine = lines => {
+                for (const line of lines) {
+                  const lower = normalize(line);
+                  if (!lower || optionSet.has(lower) || ignoredExact.has(lower)) continue;
+                  if (ignoredContains.some(token => lower.includes(token))) continue;
+                  if (line.includes('?')) return line;
+                }
+                for (const line of lines) {
+                  const lower = normalize(line);
+                  if (!lower || optionSet.has(lower) || ignoredExact.has(lower)) continue;
+                  if (ignoredContains.some(token => lower.includes(token))) continue;
+                  if (line.length >= 18) return line;
+                }
+                return '';
+              };
+
+              let cur = el;
+              for (let depth = 0; depth < 6 && cur; depth += 1) {
+                const text = (cur.innerText || '').trim();
+                if (text) {
+                  const lines = text.split('\\n').map(line => line.trim()).filter(Boolean);
+                  const chosen = chooseLine(lines);
+                  if (chosen) {
+                    return {
+                      text: chosen,
+                      strategy: depth === 0 ? 'container_self' : `container_ancestor_${depth}`,
+                    };
+                  }
+                }
+                cur = cur.parentElement;
+              }
+              return { text: '', strategy: '' };
+            }
+            """,
+            options or [],
+        ) or {}
+        return _normalize_text(str(payload.get("text", "") or "")), str(payload.get("strategy", "") or "")
+    except Exception:
+        return "", ""
+
+
+def _option_group_selector(field, input_type: str) -> str:
+    try:
+        return field.evaluate(
+            """
+            (el, desiredType) => {
+              const pathFor = node => {
+                const parts = [];
+                let cur = node;
+                while (cur && cur.nodeType === Node.ELEMENT_NODE && parts.length < 8) {
+                  let index = 1;
+                  let sib = cur;
+                  while ((sib = sib.previousElementSibling)) {
+                    if (sib.tagName === cur.tagName) index += 1;
+                  }
+                  parts.unshift(`${cur.tagName.toLowerCase()}:nth-of-type(${index})`);
+                  cur = cur.parentElement;
+                }
+                return parts.join(' > ');
+              };
+
+              let cur = el;
+              for (let depth = 0; depth < 6 && cur; depth += 1) {
+                const matches = cur.querySelectorAll(`input[type="${desiredType}"]`);
+                if (matches.length > 1) return pathFor(cur);
+                cur = cur.parentElement;
+              }
+              return pathFor(el);
+            }
+            """,
+            input_type,
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _extract_block_question(field, options: list[str] | None = None) -> tuple[str, str]:
+    direct = _normalize_text(_get_question_text(field))
+    if direct and not _looks_like_choice_label(direct, options) and not _is_non_question_control(direct, options):
+        return direct, "direct"
+
+    if options:
+        group_question = _normalize_text(_get_radio_group_question(field))
+        if group_question and not _looks_like_choice_label(group_question, options) and not _is_non_question_control(group_question, options):
+            return group_question, "group"
+
+    container_text, strategy = _extract_question_from_container(field, options)
+    if container_text and not _looks_like_choice_label(container_text, options) and not _is_non_question_control(container_text, options):
+        return container_text, strategy or "container"
+
+    if options:
+        fallback = _normalize_text(_find_better_group_question(field, options))
+        if fallback and not _is_non_question_control(fallback, options):
+            return fallback, "fallback_group"
+
+    return direct or container_text, strategy or "fallback"
+
+
+def _log_question_block(run_logger, block: QuestionBlock) -> None:
+    if not run_logger or not block.question_text:
+        return
+    run_logger.info(
+        "Employer question block: kind=%s strategy=%s key=%s question=%r options=%s",
+        block.kind,
+        block.debug_strategy,
+        block.key[:160],
+        block.question_text[:250],
+        block.options[:8],
+    )
+
+
+def _extract_question_blocks(page: Page, run_logger=None) -> list[QuestionBlock]:
+    blocks: list[QuestionBlock] = []
+    processed_radio: set[str] = set()
+    processed_checkbox: set[str] = set()
+    processed_custom: set[str] = set()
+    fields = page.locator("input, textarea, select, [role='radiogroup'], [role='listbox']")
+
+    count = fields.count()
+    for index in range(count):
+        field = fields.nth(index)
+        if not _is_visible_enabled(field):
+            continue
+
+        tag = (field.evaluate("el => el.tagName.toLowerCase()") or "").lower()
+        role = (field.get_attribute("role") or "").lower()
+        input_type = (field.get_attribute("type") or "").lower()
+
+        if role in {"radiogroup", "listbox"}:
+            container_key = _element_dom_path(field) or f"{role}_{index}"
+            if container_key in processed_custom:
+                continue
+            processed_custom.add(container_key)
+            try:
+                if field.locator("input, textarea, select").count():
+                    continue
+            except Exception:
+                pass
+
+            if role == "radiogroup":
+                option_locator = field.locator("[role='radio']")
+                items: list[tuple[Any, str]] = []
+                options: list[str] = []
+                for option_index in range(option_locator.count()):
+                    option = option_locator.nth(option_index)
+                    if not _is_visible_enabled(option):
+                        continue
+                    label = _normalize_text(
+                        (option.get_attribute("aria-label") or "")
+                        or (option.get_attribute("innerText") or "")
+                    )
+                    if not label:
+                        try:
+                            label = _normalize_text(option.inner_text() or "")
+                        except Exception:
+                            label = ""
+                    if label:
+                        items.append((option, label))
+                        options.append(label)
+                if not items:
+                    continue
+                question_text, strategy = _extract_block_question(field, options)
+                block = QuestionBlock(
+                    kind="aria_radio",
+                    question_text=question_text,
+                    options=options,
+                    field=field,
+                    items=items,
+                    debug_strategy=strategy or "aria_radiogroup",
+                    key=container_key,
+                )
+                _log_question_block(run_logger, block)
+                blocks.append(block)
+                continue
+
+            if role == "listbox":
+                option_locator = field.locator("[role='option']")
+                items = []
+                options = []
+                for option_index in range(option_locator.count()):
+                    option = option_locator.nth(option_index)
+                    try:
+                        label = _normalize_text(option.inner_text() or "")
+                    except Exception:
+                        label = ""
+                    if label:
+                        items.append((option, label))
+                        options.append(label)
+                if not items:
+                    continue
+                is_multi_select = False
+                try:
+                    is_multi_select = (field.get_attribute("aria-multiselectable") or "").lower() == "true"
+                except Exception:
+                    is_multi_select = False
+                question_text, strategy = _extract_block_question(field, options)
+                block = QuestionBlock(
+                    kind="aria_listbox",
+                    question_text=question_text,
+                    options=options,
+                    field=field,
+                    items=items,
+                    allow_multiple=is_multi_select,
+                    debug_strategy=strategy or "aria_listbox",
+                    key=container_key,
+                )
+                _log_question_block(run_logger, block)
+                blocks.append(block)
+                continue
+
+        if tag == "input" and input_type in {"hidden", "file", "submit", "button", "image", "search"}:
+            continue
+
+        raw_question = _get_question_text(field)
+        if _is_resume_field(field, raw_question) or _is_cover_letter_field(field, raw_question):
+            continue
+
+        if tag == "select":
+            option_locator = field.locator("option")
+            options = [(option_locator.nth(i).text_content() or "").strip() for i in range(option_locator.count())]
+            is_multi_select = False
+            try:
+                is_multi_select = bool(field.evaluate("el => !!el.multiple"))
+            except Exception:
+                is_multi_select = False
+            question_text, strategy = _extract_block_question(field, options)
+            block = QuestionBlock(
+                kind="select",
+                question_text=question_text,
+                options=options,
+                field=field,
+                allow_multiple=is_multi_select,
+                debug_strategy=strategy or "select",
+                key=_element_dom_path(field),
+            )
+            _log_question_block(run_logger, block)
+            blocks.append(block)
+            continue
+
+        if input_type == "radio":
+            name = (field.get_attribute("name") or "").strip()
+            group_key = name or _option_group_selector(field, "radio") or f"radio_{index}"
+            if group_key in processed_radio:
+                continue
+            processed_radio.add(group_key)
+            if name:
+                radio_group = page.locator(f"input[type='radio'][name='{name}']")
+            else:
+                radio_group = page.locator(group_key).locator("input[type='radio']")
+            items = []
+            options = []
+            for radio_index in range(radio_group.count()):
+                radio = radio_group.nth(radio_index)
+                if not _is_visible_enabled(radio):
+                    continue
+                label = _get_question_text(radio)
+                if not label:
+                    label = radio.evaluate(
+                        """
+                        el => {
+                          const wrapper = el.closest('label');
+                          return wrapper ? (wrapper.innerText || '').trim() : '';
+                        }
+                        """
+                    ) or ""
+                label = _normalize_text(label)
+                if label:
+                    options.append(label)
+                items.append((radio, label))
+            question_text, strategy = _extract_block_question(field, options)
+            block = QuestionBlock(
+                kind="radio",
+                question_text=question_text,
+                options=options,
+                field=field,
+                items=items,
+                debug_strategy=strategy or "radio",
+                key=f"radio:{group_key}",
+            )
+            _log_question_block(run_logger, block)
+            blocks.append(block)
+            continue
+
+        if input_type == "checkbox":
+            name = (field.get_attribute("name") or "").strip()
+            group_key = name or _option_group_selector(field, "checkbox") or raw_question or f"checkbox_{index}"
+            if group_key in processed_checkbox:
+                continue
+            processed_checkbox.add(group_key)
+            checkbox_group = page.locator(f"input[type='checkbox'][name='{name}']") if name else page.locator(group_key).locator("input[type='checkbox']")
+            items = []
+            options = []
+            for box_index in range(checkbox_group.count()):
+                checkbox = checkbox_group.nth(box_index)
+                if not _is_visible_enabled(checkbox):
+                    continue
+                label = _get_question_text(checkbox)
+                if not label:
+                    label = checkbox.evaluate(
+                        """
+                        el => {
+                          const wrapper = el.closest('label');
+                          return wrapper ? (wrapper.innerText || '').trim() : '';
+                        }
+                        """
+                    ) or ""
+                label = _normalize_text(label)
+                if label:
+                    options.append(label)
+                items.append((checkbox, label))
+            question_text, strategy = _extract_block_question(field, options)
+            block = QuestionBlock(
+                kind="checkbox",
+                question_text=question_text,
+                options=options,
+                field=field,
+                items=items,
+                allow_multiple=True,
+                debug_strategy=strategy or "checkbox",
+                key=f"checkbox:{group_key}",
+            )
+            _log_question_block(run_logger, block)
+            blocks.append(block)
+            continue
+
+        question_text, strategy = _extract_block_question(field, None)
+        block = QuestionBlock(
+            kind="text",
+            question_text=question_text,
+            options=[],
+            field=field,
+            debug_strategy=strategy or "text",
+            key=_element_dom_path(field),
+        )
+        _log_question_block(run_logger, block)
+        blocks.append(block)
+
+    return blocks
+
+
 def _build_qa_memory_table(question_store, question_text: str, options: list[str] | None) -> str:
     prior = question_store.format_prompt_context(question_text, options) if question_store else "N/A"
     if prior != "N/A":
@@ -369,15 +791,11 @@ def fill_questionnaire(
     page: Page,
     config: dict,
     resume_text: str,
-    job_text: str,
     run_logger=None,
     question_store=None,
 ) -> bool:
     changed = False
-    fields = page.locator("input, textarea, select")
-    processed_radio: set[str] = set()
-    processed_checkbox: set[str] = set()
-    answer_cache: dict[tuple[str, tuple[str, ...]], dict] = {}
+    answer_cache: dict[tuple[str, tuple[str, ...], bool], dict] = {}
     llm_cfg = config.get("llm", {})
     confidence_threshold = float(llm_cfg.get("question_low_confidence_threshold", 0.85))
 
@@ -487,6 +905,14 @@ def fill_questionnaire(
                 source = user_source
                 confidence = user_confidence
             elif requires_confirmation:
+                if run_logger:
+                    run_logger.info(
+                        "Sensitive question answer dropped: question=%r suggested_answer=%r confidence=%s reason=%r",
+                        question_text[:250],
+                        (answer or "")[:200],
+                        "" if confidence is None else f"{float(confidence):.2f}",
+                        (reason or "")[:200],
+                    )
                 answer = None
                 source = None
                 confidence = None
@@ -548,15 +974,6 @@ def fill_questionnaire(
                 (answer or "")[:250],
                 (final_value or "")[:250],
             )
-        if question_store and hasattr(question_store, "record_application_event") and question_text:
-            question_store.record_application_event(
-                kind=kind,
-                question_text=question_text,
-                options=options,
-                resolution=resolution,
-                final_value=final_value,
-                status=status,
-            )
         if question_store and question_text and final_value and status in persistable_statuses and source in {"user", "memory", "memory_similar", "llm"}:
             question_store.remember(
                 question_text=question_text,
@@ -567,34 +984,49 @@ def fill_questionnaire(
                 verified=(source in {"user", "memory", "memory_similar"}),
             )
 
-    count = fields.count()
-    for index in range(count):
-        field = fields.nth(index)
-        if not _is_visible_enabled(field):
+    blocks = _extract_question_blocks(page, run_logger)
+    usable_blocks: list[QuestionBlock] = []
+    for block in blocks:
+        field = block.field
+        question_text = block.question_text
+        options = block.options
+        if not question_text:
             continue
-        tag = (field.evaluate("el => el.tagName.toLowerCase()") or "").lower()
-        input_type = (field.get_attribute("type") or "").lower()
-        if tag == "input" and input_type in {"hidden", "file", "submit", "button", "image", "search"}:
-            continue
-        question_text = _get_question_text(field)
         if _is_resume_field(field, question_text) or _is_cover_letter_field(field, question_text):
             continue
+        if _is_non_question_control(question_text, options):
+            continue
+        usable_blocks.append(block)
 
-        if tag == "select":
-            option_locator = field.locator("option")
-            options = [(option_locator.nth(i).text_content() or "").strip() for i in range(option_locator.count())]
-            is_multi_select = False
-            try:
-                is_multi_select = bool(field.evaluate("el => !!el.multiple"))
-            except Exception:
-                is_multi_select = False
-            resolution = resolve_answer(question_text, options, allow_multiple=is_multi_select)
+    if usable_blocks:
+        _log_progress(run_logger, "Application stage: questionnaire page detected questions=%d", len(usable_blocks))
+    else:
+        _log_progress(run_logger, "Application stage: no questionnaire questions detected on current page")
+
+    for index, block in enumerate(usable_blocks, start=1):
+        field = block.field
+        question_text = block.question_text
+        options = block.options
+        _log_progress(
+            run_logger,
+            "Application stage: answering question %d/%d kind=%s question=%r",
+            index,
+            len(usable_blocks),
+            block.kind,
+            question_text[:160],
+        )
+
+        if block.kind == "select":
+            resolution = resolve_answer(question_text, options, allow_multiple=block.allow_multiple)
             log_resolution("select", question_text, resolution, options)
             answer = resolution.get("answer")
             if not answer:
                 log_application("select", question_text, resolution, _selected_option_value(field), "no_answer", options)
                 continue
-            desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+            if block.allow_multiple:
+                desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+            else:
+                desired = [answer]
             matched = []
             for item in desired:
                 best = exact_option_match(options, item)
@@ -602,12 +1034,12 @@ def fill_questionnaire(
                     matched.append(best)
             if matched:
                 try:
-                    if is_multi_select:
+                    if block.allow_multiple:
                         field.select_option(label=matched)
                     else:
                         field.select_option(label=matched[0])
                     changed = True
-                    final_value = ", ".join(matched) if is_multi_select else (_selected_option_value(field) or matched[0])
+                    final_value = ", ".join(matched) if block.allow_multiple else (_selected_option_value(field) or matched[0])
                     log_application("select", question_text, resolution, final_value, "selected", options)
                 except Exception:
                     log_application("select", question_text, resolution, _selected_option_value(field), "select_failed", options)
@@ -615,45 +1047,19 @@ def fill_questionnaire(
                 log_application("select", question_text, resolution, _selected_option_value(field), "no_option_match", options)
             continue
 
-        if input_type == "radio":
-            name = (field.get_attribute("name") or "").strip() or f"radio_{index}"
-            if name in processed_radio:
-                continue
-            processed_radio.add(name)
-            radio_group = page.locator(f"input[type='radio'][name='{name}']")
-            options: list[str] = []
-            radios = []
-            for radio_index in range(radio_group.count()):
-                radio = radio_group.nth(radio_index)
-                label = _get_question_text(radio)
-                if not label:
-                    label = radio.evaluate(
-                        """
-                        el => {
-                          const wrapper = el.closest('label');
-                          return wrapper ? (wrapper.innerText || '').trim() : '';
-                        }
-                        """
-                    ) or ""
-                options.append(label)
-                radios.append((radio, label))
-            group_question = _get_radio_group_question(field) or _get_question_text(field)
-            if _looks_like_choice_label(group_question, options):
-                group_question = _find_better_group_question(field, options)
-            if _is_resume_field(field, group_question) or _is_cover_letter_field(field, group_question) or _is_non_question_control(group_question, options):
-                continue
-            resolution = resolve_answer(group_question, options)
-            log_resolution("radio", group_question, resolution, options)
+        if block.kind == "radio":
+            resolution = resolve_answer(question_text, options)
+            log_resolution("radio", question_text, resolution, options)
             answer = resolution.get("answer")
             if not answer:
-                log_application("radio", group_question, resolution, "", "no_answer", options)
+                log_application("radio", question_text, resolution, "", "no_answer", options)
                 continue
             chosen = exact_option_match(options, answer)
             if not chosen:
-                log_application("radio", group_question, resolution, "", "no_option_match", options)
+                log_application("radio", question_text, resolution, "", "no_option_match", options)
                 continue
             applied = False
-            for radio, label in radios:
+            for radio, label in block.items:
                 if exact_option_match([label], chosen):
                     try:
                         radio.check()
@@ -662,48 +1068,20 @@ def fill_questionnaire(
                     except Exception:
                         applied = False
                     break
-            log_application("radio", group_question, resolution, chosen, "selected" if applied else "select_failed", options)
+            log_application("radio", question_text, resolution, chosen, "selected" if applied else "select_failed", options)
             continue
 
-        if input_type == "checkbox":
-            name = (field.get_attribute("name") or "").strip() or question_text or f"checkbox_{index}"
-            if name in processed_checkbox:
-                continue
-            processed_checkbox.add(name)
-            checkbox_group = page.locator(f"input[type='checkbox'][name='{name}']") if field.get_attribute("name") else page.locator("input[type='checkbox']")
-            options: list[str] = []
-            checkboxes = []
-            for box_index in range(checkbox_group.count()):
-                checkbox = checkbox_group.nth(box_index)
-                if not _is_visible_enabled(checkbox):
-                    continue
-                label = _get_question_text(checkbox)
-                if not label:
-                    label = checkbox.evaluate(
-                        """
-                        el => {
-                          const wrapper = el.closest('label');
-                          return wrapper ? (wrapper.innerText || '').trim() : '';
-                        }
-                        """
-                    ) or ""
-                options.append(label)
-                checkboxes.append((checkbox, label))
-            group_question = _get_radio_group_question(field) or _get_question_text(field)
-            if _looks_like_choice_label(group_question, options):
-                group_question = _find_better_group_question(field, options)
-            if _is_resume_field(field, group_question) or _is_cover_letter_field(field, group_question) or _is_non_question_control(group_question, options):
-                continue
-            resolution = resolve_answer(group_question, options, allow_multiple=True)
-            log_resolution("checkbox", group_question, resolution, options)
+        if block.kind == "checkbox":
+            resolution = resolve_answer(question_text, options, allow_multiple=True)
+            log_resolution("checkbox", question_text, resolution, options)
             answer = resolution.get("answer")
             if not answer:
-                log_application("checkbox", group_question, resolution, "", "no_answer", options)
+                log_application("checkbox", question_text, resolution, "", "no_answer", options)
                 continue
             desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
             selected_labels: list[str] = []
             matched_label = False
-            for checkbox, label in checkboxes:
+            for checkbox, label in block.items:
                 if any(exact_option_match([label], desired_item) for desired_item in desired):
                     matched_label = True
                     if _check_checkbox(checkbox):
@@ -711,7 +1089,54 @@ def fill_questionnaire(
                         if label:
                             selected_labels.append(label)
             status = "selected" if selected_labels else ("select_failed" if matched_label else "no_option_match")
-            log_application("checkbox", group_question, resolution, ", ".join(selected_labels), status, options)
+            log_application("checkbox", question_text, resolution, ", ".join(selected_labels), status, options)
+            continue
+
+        if block.kind == "aria_radio":
+            resolution = resolve_answer(question_text, options)
+            log_resolution("aria_radio", question_text, resolution, options)
+            answer = resolution.get("answer")
+            if not answer:
+                log_application("aria_radio", question_text, resolution, "", "no_answer", options)
+                continue
+            chosen = exact_option_match(options, answer)
+            if not chosen:
+                log_application("aria_radio", question_text, resolution, "", "no_option_match", options)
+                continue
+            applied = False
+            for option, label in block.items:
+                if exact_option_match([label], chosen):
+                    try:
+                        option.click(force=True)
+                        changed = True
+                        applied = True
+                    except Exception:
+                        applied = False
+                    break
+            log_application("aria_radio", question_text, resolution, chosen, "selected" if applied else "select_failed", options)
+            continue
+
+        if block.kind == "aria_listbox":
+            resolution = resolve_answer(question_text, options, allow_multiple=block.allow_multiple)
+            log_resolution("aria_listbox", question_text, resolution, options)
+            answer = resolution.get("answer")
+            if not answer:
+                log_application("aria_listbox", question_text, resolution, "", "no_answer", options)
+                continue
+            desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+            selected_labels: list[str] = []
+            matched_label = False
+            for option, label in block.items:
+                if any(exact_option_match([label], desired_item) for desired_item in desired):
+                    matched_label = True
+                    try:
+                        option.click(force=True)
+                        changed = True
+                        selected_labels.append(label)
+                    except Exception:
+                        continue
+            status = "selected" if selected_labels else ("select_failed" if matched_label else "no_option_match")
+            log_application("aria_listbox", question_text, resolution, ", ".join(selected_labels), status, options)
             continue
 
         resolution = resolve_answer(question_text)
@@ -745,4 +1170,10 @@ def fill_questionnaire(
             except Exception:
                 log_application("text", question_text, resolution, _current_value(field), "fill_failed", None)
                 continue
+    _log_progress(
+        run_logger,
+        "Application stage: questionnaire page complete questions=%d changed=%s",
+        len(usable_blocks),
+        changed,
+    )
     return changed
