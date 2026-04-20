@@ -730,6 +730,7 @@ def _prompt_user_for_answer(
     reason: str | None,
     config: dict,
     run_logger=None,
+    allow_multiple: bool = False,
 ) -> tuple[str | None, str | None, float | None]:
     if not sys.stdin.isatty():
         if run_logger:
@@ -759,23 +760,50 @@ def _prompt_user_for_answer(
         print("Options:")
         for idx, option in enumerate(options, start=1):
             print(f"  {idx}. {option}")
-        if suggested_option:
-            print(f"Suggested: {suggested_option} (confidence {float(confidence or 0.0):.2f})")
+        suggested_display = suggested_answer if allow_multiple else suggested_option
+        if suggested_display:
+            print(f"Suggested: {suggested_display} (confidence {float(confidence or 0.0):.2f})")
         while True:
-            prompt = "Select option number"
-            if suggested_option:
+            if allow_multiple:
+                prompt = "Select option numbers (comma-separated) or exact option text"
+            else:
+                prompt = "Select option number"
+            if suggested_display:
                 prompt += " or press Enter to accept the suggestion"
             raw = input(f"{prompt}: ").strip()
-            if not raw and suggested_option:
-                return suggested_option, "user", 1.0
-            if raw.isdigit():
+            if not raw and suggested_display:
+                return suggested_display, "user", 1.0
+            if allow_multiple and raw:
+                tokens = [t.strip() for t in raw.split(",") if t.strip()]
+                matched: list[str] = []
+                valid = True
+                for token in tokens:
+                    if token.isdigit():
+                        idx = int(token)
+                        if 1 <= idx <= len(options):
+                            matched.append(options[idx - 1])
+                            continue
+                    direct = exact_option_match(options, token)
+                    if direct:
+                        matched.append(direct)
+                        continue
+                    valid = False
+                    break
+                if valid and matched:
+                    seen: set[str] = set()
+                    unique = [m for m in matched if not (m in seen or seen.add(m))]
+                    return ", ".join(unique), "user", 1.0
+            elif raw.isdigit():
                 idx = int(raw)
                 if 1 <= idx <= len(options):
                     return options[idx - 1], "user", 1.0
-            direct_match = exact_option_match(options, raw) if raw else None
+            direct_match = exact_option_match(options, raw) if raw and not allow_multiple else None
             if direct_match:
                 return direct_match, "user", 1.0
-            print("Invalid selection. Enter an option number or the exact option text.")
+            if allow_multiple:
+                print("Invalid selection. Enter comma-separated option numbers or exact option text.")
+            else:
+                print("Invalid selection. Enter an option number or the exact option text.")
     else:
         if suggested_answer:
             print(f"Suggested: {suggested_answer} (confidence {float(confidence or 0.0):.2f})")
@@ -849,6 +877,7 @@ def fill_questionnaire(
                         f"Verified prior answer from similar question: {similar_question[:160]}",
                         config,
                         run_logger,
+                        allow_multiple=allow_multiple,
                     )
                     if user_answer:
                         answer = user_answer
@@ -899,6 +928,7 @@ def fill_questionnaire(
                 reason,
                 config,
                 run_logger,
+                allow_multiple=allow_multiple,
             )
             if user_answer:
                 answer = user_answer
