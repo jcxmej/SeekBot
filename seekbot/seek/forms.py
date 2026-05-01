@@ -42,14 +42,40 @@ def normalize_choice(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def _normalize_option_label(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower()).strip()
+
+
+def _normalize_option_label_fallback(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9+#. ]+", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def exact_option_match(options: list[str] | None, answer: str | None) -> str | None:
     if not options or not answer:
         return None
-    normalized_answer = normalize_choice(answer)
+    normalized_answer = _normalize_option_label(answer)
     for option in options:
-        if normalize_choice(option) == normalized_answer:
+        if _normalize_option_label(option) == normalized_answer:
+            return option
+    fallback_answer = _normalize_option_label_fallback(answer)
+    for option in options:
+        if _normalize_option_label_fallback(option) == fallback_answer:
             return option
     return None
+
+
+def _split_multi_answer(answer: str | None) -> list[str]:
+    return [part.strip() for part in str(answer or "").split(",") if part.strip()]
+
+
+def _answer_maps_to_options(options: list[str] | None, answer: str | None, allow_multiple: bool = False) -> bool:
+    if not options or not answer:
+        return False
+    if allow_multiple:
+        parts = _split_multi_answer(answer)
+        return bool(parts) and all(exact_option_match(options, part) for part in parts)
+    return exact_option_match(options, answer) is not None
 
 
 def _get_question_text(field) -> str:
@@ -482,7 +508,7 @@ def _log_question_block(run_logger, block: QuestionBlock) -> None:
         block.debug_strategy,
         block.key[:160],
         block.question_text[:250],
-        block.options[:8],
+                        block.options,
     )
 
 
@@ -746,7 +772,7 @@ def _prompt_user_for_answer(
         run_logger.info(
             "Employer question awaiting user input: question=%r options=%s suggested_answer=%r confidence=%.2f reason=%r",
             question_text[:250],
-            (options or [])[:8],
+            options or [],
             (suggested_answer or "")[:200],
             float(confidence or 0.0),
             (reason or "")[:200],
@@ -853,7 +879,7 @@ def fill_questionnaire(
                     run_logger.info(
                         "Employer question reused from verified memory: question=%r options=%s answer=%r",
                         question_text[:250],
-                        (options or [])[:8],
+                        options or [],
                         answer[:200],
                     )
 
@@ -915,7 +941,7 @@ def fill_questionnaire(
             confidence = None
             reason = ""
 
-        if options and answer and not exact_option_match(options, answer):
+        if options and answer and not _answer_maps_to_options(options, answer, allow_multiple=allow_multiple):
             confidence = 0.0
             reason = reason or "Answer did not map cleanly to one of the available options."
 
@@ -974,7 +1000,7 @@ def fill_questionnaire(
                 (reason or "")[:200],
                 (question_issue or "")[:200],
                 question_text[:250],
-                (options or [])[:8],
+                options or [],
                 answer[:250],
             )
         else:
@@ -984,7 +1010,7 @@ def fill_questionnaire(
                 (reason or "")[:200],
                 (question_issue or "")[:200],
                 question_text[:250],
-                (options or [])[:8],
+                options or [],
             )
 
     def log_application(kind: str, question_text: str, resolution: dict, final_value: str | None, status: str, options: list[str] | None = None) -> None:
@@ -1000,7 +1026,7 @@ def fill_questionnaire(
                 source or "",
                 "" if confidence is None else f"{float(confidence):.2f}",
                 question_text[:250],
-                (options or [])[:8],
+                options or [],
                 (answer or "")[:250],
                 (final_value or "")[:250],
             )
@@ -1054,7 +1080,7 @@ def fill_questionnaire(
                 log_application("select", question_text, resolution, _selected_option_value(field), "no_answer", options)
                 continue
             if block.allow_multiple:
-                desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+                desired = _split_multi_answer(answer) or [answer]
             else:
                 desired = [answer]
             matched = []
@@ -1108,7 +1134,7 @@ def fill_questionnaire(
             if not answer:
                 log_application("checkbox", question_text, resolution, "", "no_answer", options)
                 continue
-            desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+            desired = _split_multi_answer(answer) or [answer]
             selected_labels: list[str] = []
             matched_label = False
             for checkbox, label in block.items:
@@ -1153,7 +1179,7 @@ def fill_questionnaire(
             if not answer:
                 log_application("aria_listbox", question_text, resolution, "", "no_answer", options)
                 continue
-            desired = [part.strip() for part in answer.split(",") if part.strip()] or [answer]
+            desired = _split_multi_answer(answer) or [answer]
             selected_labels: list[str] = []
             matched_label = False
             for option, label in block.items:

@@ -138,7 +138,16 @@ This file records the current project decisions, constraints, and deferred ideas
 
 - Expand widget adapters for richer custom controls after more real runs.
 - Refine the hybrid matcher, including weighting, thresholds, and better semantic memory reuse.
-- Move local persistence from CSV/files to Postgres with `pgvector`.
+- Semantic normalization should preserve high-end ordering for resume selection:
+  - a floor is useful to suppress random background cosine noise
+  - a hard ceiling is not ideal for ranking multiple strong resumes against the same JD because it flattens meaningful differences
+  - if the display score still wants a ceiling later, keep that separate from the ranking signal
 - Use DB queries as the first eval/reporting layer instead of adding a separate eval CSV.
 - The initial DB-backed eval/report layer is a small script over `jobs` and `qa_memory`, not a separate evaluation subsystem.
+- Expand from per-job LangGraph orchestration to run-level orchestration only when it adds clear value:
+  - explicit run states
+  - checkpointed stop/resume
+  - cleaner retry and human-checkpoint flows
+- Provider routing and cost policy are worthwhile future architecture work once the current runtime behavior is stable.
+- Human-in-the-loop state should eventually become persisted workflow state rather than only terminal interaction.
 - Add better automated test coverage.

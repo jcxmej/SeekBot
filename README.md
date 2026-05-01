@@ -442,6 +442,9 @@ The next version should focus on:
 
 - broader support for richer custom widgets beyond the current native/ARIA handlers
 - expanding the DB-backed eval/report layer beyond the initial query script
+- run-level LangGraph orchestration with explicit run states and checkpointed resume support
+- provider routing and cost policy so local vs hosted models can be selected per task type
+- persisted human-in-the-loop checkpoints for resumable low-confidence question handling
 - more targeted matching calibration after more real runs
 - stronger automated test coverage
 
